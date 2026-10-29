@@ -1,0 +1,32 @@
+[
+  {
+    "id": "usr_admin_root",
+    "email": "admin@smilemachines.internal",
+    "name": "System Administrator",
+    "passwordHash": "f89f08d4e6be3bfa40cb3f6a198abd1e5d9ed93c314a08aded06ef9b1ef1f10551a4322302ba693a1a2f2f3f8729e20a699f6645e0ac90c6acfc2261082b6821",
+    "salt": "be85f1b95acf5f0976abaefb0556f80c",
+    "role": "admin",
+    "licenseTier": "enterprise",
+    "status": "active",
+    "maxLeads": 1000000,
+    "maxConcurrentJobs": 20,
+    "totalLeadsStored": 0,
+    "createdAt": "2026-10-23T14:59:15.877Z",
+    "lastLoginAt": "2026-10-23T15:44:31.317Z"
+  },
+  {
+    "id": "usr_632293ae-5d4",
+    "email": "sales_lead@enterprise.com",
+    "name": "Alex Hunter",
+    "passwordHash": "36a15292d90b43e82f92aa66dc9632a4260d2a1de3778552ff90b5d53ecf80dfbbce8f623ded6aa8cab8c4b2a2601873cca4c782861ca6b4d88bb9303d478c54",
+    "salt": "c0d2052148fbd5ed98fa71312bd6160e",
+    "role": "user",
+    "licenseTier": "pro",
+    "licenseKey": "PRO-8821-X9A7",
+    "status": "active",
+    "maxLeads": 50000,
+    "maxConcurrentJobs": 5,
+    "totalLeadsStored": 0,
+    "createdAt": "2026-10-23T14:59:44.010Z"
+  }
+]

@@ -1,0 +1,32 @@
+[
+  {
+    "key": "PRO-8821-X9A7",
+    "tier": "pro",
+    "maxLeads": 50000,
+    "maxConcurrentJobs": 5,
+    "status": "used",
+    "createdAt": "2026-10-23T14:59:15.878Z",
+    "notes": "Professional License Tier (50,000 leads, 5 background jobs)",
+    "assignedToUserId": "usr_632293ae-5d4",
+    "assignedToEmail": "sales_lead@enterprise.com",
+    "activatedAt": "2026-10-23T14:59:44.010Z"
+  },
+  {
+    "key": "ENT-9942-K3L1",
+    "tier": "enterprise",
+    "maxLeads": 500000,
+    "maxConcurrentJobs": 25,
+    "status": "active",
+    "createdAt": "2026-10-23T14:59:15.878Z",
+    "notes": "Enterprise Tier (500,000 leads, 25 background jobs)"
+  },
+  {
+    "key": "CORP-4401-Z8B5",
+    "tier": "enterprise",
+    "maxLeads": 1000000,
+    "maxConcurrentJobs": 50,
+    "status": "active",
+    "createdAt": "2026-10-23T14:59:15.878Z",
+    "notes": "Corporate Unlimited License Tier (1,000,000 leads)"
+  }
+]

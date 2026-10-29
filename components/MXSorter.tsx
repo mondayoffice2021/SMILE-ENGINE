@@ -1,0 +1,2435 @@
+import React, { useState, useRef, useMemo, useEffect } from 'react';
+import DocumentArrowUpIcon from './icons/DocumentArrowUpIcon';
+import FolderOpenIcon from './icons/FolderOpenIcon';
+import ArrowPathIcon from './icons/ArrowPathIcon';
+import ArrowsRightLeftIcon from './icons/ArrowsRightLeftIcon';
+import PauseIcon from './icons/PauseIcon';
+import PlayIcon from './icons/PlayIcon';
+import StopIcon from './icons/StopIcon';
+import ClipboardIcon from './icons/ClipboardIcon';
+import CheckIcon from './icons/CheckIcon';
+import XCircleIcon from './icons/XCircleIcon';
+import MagnifyingGlassIcon from './icons/MagnifyingGlassIcon';
+import GlobeAltIcon from './icons/GlobeAltIcon';
+import JSZip from 'jszip';
+import * as XLSX from 'xlsx';
+import { Send } from 'lucide-react';
+import type { ExtractedEmail } from '../types';
+import { useActiveWakeLock } from '../hooks/useWakeLock';
+import {
+  extractTargetsForMXFromFile,
+  extractTargetsFromFolderFiles,
+  isSupportedFolderFile,
+  type MXFileExtractResult,
+  type MXFolderExtractResult
+} from '../services/fileService';
+import { safeFetchJson } from '../services/safeFetch';
+import {
+  cleanAndDeduplicateTargets,
+  DEFAULT_CLEAN_FILTER_CONFIG,
+  type CleanFilterConfig,
+  type CleanAndDeduplicateResult
+} from '../services/businessEmailFilter';
+import { CloudDbActionBar } from './CloudDbActionBar';
+import { serverApi, type UserProfile, type ServerLead } from '../services/serverApiClient';
+import { AutoDownloadBar } from './AutoDownloadBar';
+import { AutoDownloadFinishModal } from './AutoDownloadFinishModal';
+import { SecretCloudVaultModal } from './SecretCloudVaultModal';
+import { downloadCategoriesAsZip } from '../services/exportZip';
+import { uploadFileToCloudTemp, deleteCloudTempFile, fetchLinesFromCloudTemp } from '../services/cloudTempStorageClient';
+
+interface MXSorterProps {
+  showToast: (msg: string) => void;
+  onSendToEmailSender?: (leads: ExtractedEmail[]) => void;
+  onNavigateTab?: (tab: string, emails?: string[]) => void;
+  initialTargets?: string[];
+  currentUser?: UserProfile | null;
+  onOpenAuth?: () => void;
+  onNavigateToServerJobs?: () => void;
+}
+
+interface MXGroup {
+  provider: string;
+  emails: string[];
+}
+
+// Enterprise & Global MX Pattern Matching
+const MX_PATTERNS: { [key: string]: string[] } = {
+  'Google Workspace': ['google.com', 'googlemail.com', 'aspmx.l.google.com', 'l.google.com'],
+  'Microsoft 365': ['outlook.com', 'protection.outlook.com', 'hotmail.com', 'microsoft.com', 'office365.com', 'mail.protection.outlook.com'],
+  'Zoho Mail': ['zoho.com', 'zoho.eu', 'zoho.in'],
+  'Mimecast': ['mimecast.com'],
+  'Proofpoint': ['pphosted.com', 'ppe-hosted.com', 'proofpoint.com'],
+  'GoDaddy': ['secureserver.net'],
+  'Namecheap / PrivateEmail': ['registrar-servers.com', 'oxcs.net', 'privateemail.com'],
+  'Fastmail': ['fastmail.com', 'messagingengine.com'],
+  'ProtonMail': ['protonmail.ch', 'proton.me'],
+  'Yandex': ['yandex.net', 'yandex.com', 'yandex.ru'],
+  'Amazon SES / WorkMail': ['amazonses.com', 'awsapps.com'],
+  'Rackspace': ['emailsrvr.com'],
+  'OVHcloud': ['ovh.net', 'ovh.com', 'ovh.ca'],
+  'Mailgun': ['mailgun.org', 'mailgun.com'],
+  'SendGrid': ['sendgrid.net'],
+  'Brevo / Sendinblue': ['sendinblue.com', 'brevo.com'],
+  'Cisco IronPort': ['iphmx.com', 'ironport.com'],
+  'Barracuda': ['barracudanetworks.com', 'ess.barracuda.com'],
+  'Apple iCloud': ['icloud.com', 'apple.com']
+};
+
+const PROVIDER_COLORS: { [key: string]: { bg: string; border: string; text: string; badge: string } } = {
+  'Google Workspace': { bg: 'bg-emerald-950/30', border: 'border-emerald-500/40', text: 'text-emerald-300', badge: 'bg-emerald-900/60 text-emerald-300 border-emerald-600/50' },
+  'Microsoft 365': { bg: 'bg-blue-950/30', border: 'border-blue-500/40', text: 'text-blue-300', badge: 'bg-blue-900/60 text-blue-300 border-blue-600/50' },
+  'Zoho Mail': { bg: 'bg-amber-950/30', border: 'border-amber-500/40', text: 'text-amber-300', badge: 'bg-amber-900/60 text-amber-300 border-amber-600/50' },
+  'Mimecast': { bg: 'bg-purple-950/30', border: 'border-purple-500/40', text: 'text-purple-300', badge: 'bg-purple-900/60 text-purple-300 border-purple-600/50' },
+  'Proofpoint': { bg: 'bg-indigo-950/30', border: 'border-indigo-500/40', text: 'text-indigo-300', badge: 'bg-indigo-900/60 text-indigo-300 border-indigo-600/50' },
+  'GoDaddy': { bg: 'bg-teal-950/30', border: 'border-teal-500/40', text: 'text-teal-300', badge: 'bg-teal-900/60 text-teal-300 border-teal-600/50' },
+  'Namecheap / PrivateEmail': { bg: 'bg-orange-950/30', border: 'border-orange-500/40', text: 'text-orange-300', badge: 'bg-orange-900/60 text-orange-300 border-orange-600/50' },
+  'Fastmail': { bg: 'bg-cyan-950/30', border: 'border-cyan-500/40', text: 'text-cyan-300', badge: 'bg-cyan-900/60 text-cyan-300 border-cyan-600/50' },
+  'ProtonMail': { bg: 'bg-violet-950/30', border: 'border-violet-500/40', text: 'text-violet-300', badge: 'bg-violet-900/60 text-violet-300 border-violet-600/50' },
+  'Yandex': { bg: 'bg-red-950/30', border: 'border-red-500/40', text: 'text-red-300', badge: 'bg-red-900/60 text-red-300 border-red-600/50' },
+  'Amazon SES / WorkMail': { bg: 'bg-yellow-950/30', border: 'border-yellow-500/40', text: 'text-yellow-300', badge: 'bg-yellow-900/60 text-yellow-300 border-yellow-600/50' },
+  'Rackspace': { bg: 'bg-rose-950/30', border: 'border-rose-500/40', text: 'text-rose-300', badge: 'bg-rose-900/60 text-rose-300 border-rose-600/50' }
+};
+
+const DEFAULT_COLOR = {
+  bg: 'bg-gray-800/40',
+  border: 'border-gray-700',
+  text: 'text-gray-300',
+  badge: 'bg-gray-800 text-gray-300 border-gray-700'
+};
+
+const MXSorter: React.FC<MXSorterProps> = ({
+  showToast,
+  onSendToEmailSender,
+  onNavigateTab,
+  initialTargets = [],
+  currentUser = null,
+  onOpenAuth,
+  onNavigateToServerJobs
+}) => {
+  const [inputText, setInputText] = useState('');
+  const [results, setResults] = useState<MXGroup[]>([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
+
+  // Clean Filter & Deduplication State (User requested: remove public email, banks, junk users webmaster/user etc, leave info/sales/order, remove .gov/.edu, remove duplicates, one clean results after separations)
+  const [enableAutoClean, setEnableAutoClean] = useState<boolean>(true);
+  const [cleanFilterConfig, setCleanFilterConfig] = useState<CleanFilterConfig>({
+    ...DEFAULT_CLEAN_FILTER_CONFIG
+  });
+  const [showCleanConfig, setShowCleanConfig] = useState<boolean>(false);
+  const [cleanStats, setCleanStats] = useState<CleanAndDeduplicateResult['counts'] | null>(null);
+  const [excludedItems, setExcludedItems] = useState<{ item: string; reason: string; category: string }[]>([]);
+  const [cleanConsolidatedList, setCleanConsolidatedList] = useState<{ target: string; domain: string; provider: string; type: 'email' | 'domain' }[]>([]);
+  const [viewMode, setViewMode] = useState<'clean-consolidated' | 'categorized' | 'excluded'>('clean-consolidated');
+
+  // File & Folder Upload State
+  const [isReadingFile, setIsReadingFile] = useState(false);
+  const [isScanningFolder, setIsScanningFolder] = useState(false);
+  const [folderScanProgress, setFolderScanProgress] = useState<{ current: number; total: number; emailsCount: number; currentFileName: string } | null>(null);
+  const [uploadedFile, setUploadedFile] = useState<MXFileExtractResult | null>(null);
+  const [uploadedFolder, setUploadedFolder] = useState<MXFolderExtractResult | null>(null);
+  const [isLargeFileMode, setIsLargeFileMode] = useState(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const rawFileContent = useRef<string | null>(null);
+
+  // Auto-Download ZIP & Secret Cloud Vault States
+  const [autoDownloadZip, setAutoDownloadZip] = useState<boolean>(() => {
+    return localStorage.getItem('smile_auto_download_zip') === 'true';
+  });
+  const [showFinishModal, setShowFinishModal] = useState<boolean>(false);
+  const [wasAutoDownloaded, setWasAutoDownloaded] = useState<boolean>(false);
+  const [showVaultModal, setShowVaultModal] = useState<boolean>(false);
+  const [vaultInitialData, setVaultInitialData] = useState<any>(null);
+  const [vaultItemCount, setVaultItemCount] = useState<number>(0);
+
+  // Zero-RAM Cloud Temp Storage State
+  const [tempFileId, setTempFileId] = useState<string | null>(null);
+  const [tempFilename, setTempFilename] = useState<string | null>(null);
+
+  // Results Filter & Multi-Category Email Server Compose State
+  const [selectedCategory, setSelectedCategory] = useState<string>('all');
+  const [selectedComposeProvider, setSelectedComposeProvider] = useState<string>('all');
+  const [selectedComposeCategories, setSelectedComposeCategories] = useState<string[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  // Automatically keep selectedComposeCategories in sync with results: default to all selected
+  useEffect(() => {
+    if (results.length > 0) {
+      setSelectedComposeCategories(prev => {
+        if (prev.length === 0) {
+          return results.map(r => r.provider);
+        }
+        // Retain existing valid user selections or fallback to all
+        const valid = prev.filter(p => results.some(r => r.provider === p));
+        return valid.length > 0 ? valid : results.map(r => r.provider);
+      });
+    }
+  }, [results]);
+
+  const handleToggleCategory = (provider: string) => {
+    setSelectedComposeCategories(prev =>
+      prev.includes(provider) ? prev.filter(p => p !== provider) : [...prev, provider]
+    );
+  };
+
+  const handleRemoveCategory = (provider: string) => {
+    setSelectedComposeCategories(prev => prev.filter(p => p !== provider));
+  };
+
+  const handleSelectAllCategories = () => {
+    setSelectedComposeCategories(results.map(r => r.provider));
+  };
+
+  const handleClearAllCategories = () => {
+    setSelectedComposeCategories([]);
+  };
+
+  // Compile items from all selected categories
+  const selectedCategoriesItems = useMemo(() => {
+    if (selectedComposeCategories.length === 0) return [];
+    if (cleanConsolidatedList.length > 0) {
+      return cleanConsolidatedList.filter(item => selectedComposeCategories.includes(item.provider));
+    } else {
+      const list: { target: string; domain: string; provider: string; type: 'email' | 'domain' }[] = [];
+      results
+        .filter(g => selectedComposeCategories.includes(g.provider))
+        .forEach(g => {
+          g.emails.forEach(target => {
+            list.push({
+              target,
+              domain: target.includes('@') ? target.split('@')[1] : target,
+              provider: g.provider,
+              type: target.includes('@') ? 'email' : 'domain'
+            });
+          });
+        });
+      return list;
+    }
+  }, [cleanConsolidatedList, results, selectedComposeCategories]);
+
+  const selectedEmailsCount = useMemo(() => {
+    return selectedCategoriesItems.filter(item => item.target.includes('@')).length;
+  }, [selectedCategoriesItems]);
+
+  // Auto-populate when initialTargets from another tab are passed
+  useEffect(() => {
+    if (initialTargets && initialTargets.length > 0 && !inputText.trim() && results.length === 0) {
+      if (initialTargets.length > 600) {
+        rawFileContent.current = initialTargets.join('\n');
+        setIsLargeFileMode(true);
+        setInputText(
+          `[TRANSFERRED TARGETS: ${initialTargets.length.toLocaleString()} items]\n` +
+          `Preview (first 10 items):\n${initialTargets.slice(0, 10).join('\n')}\n` +
+          `...plus ${(initialTargets.length - 10).toLocaleString()} more items stored in memory.\n\n` +
+          `Ready to analyze MX records!`
+        );
+      } else {
+        rawFileContent.current = null;
+        setIsLargeFileMode(false);
+        setInputText(initialTargets.join('\n'));
+      }
+      showToast(`Loaded ${initialTargets.length} targets from previous tab into MX Sorter!`);
+    }
+  }, [initialTargets]);
+
+  // Send selected provider leads or all clean leads directly to Compose (EmailSender)
+  const handleSendToCompose = (
+    targets: Array<{ target: string; domain?: string; provider?: string } | string>,
+    providerName?: string
+  ) => {
+    if (!onSendToEmailSender) {
+      showToast("Email Sender is not connected.");
+      return;
+    }
+
+    const leads: ExtractedEmail[] = [];
+    targets.forEach(item => {
+      const email = typeof item === 'string' ? item : item.target;
+      if (!email || !email.includes('@')) return;
+      const domain = typeof item === 'object' && item.domain ? item.domain : email.split('@')[1];
+      const provider = typeof item === 'object' && item.provider ? item.provider : providerName;
+
+      leads.push({
+        email: email.trim().toLowerCase(),
+        domain,
+        sourceUrl: `https://${domain}`,
+        companyName: domain ? domain.split('.')[0].toUpperCase() : 'Company Contact',
+        country: 'N/A',
+        isValid: true,
+        mxStatus: 'valid',
+        mxProvider: provider
+      });
+    });
+
+    if (leads.length === 0) {
+      showToast("No valid email addresses found to send to compose.");
+      return;
+    }
+
+    onSendToEmailSender(leads);
+    showToast(`Transferred ${leads.length.toLocaleString()} ${providerName ? `(${providerName})` : ''} leads directly to Email Compose!`);
+  };
+
+  // Cross-tab transfer to Validator, Country Sorter, etc.
+  const handleTransferToTab = (targetTab: string, targets: Array<{ target: string } | string>, label?: string) => {
+    if (!onNavigateTab) {
+      showToast("Tab navigation is not available.");
+      return;
+    }
+    const emails: string[] = [];
+    targets.forEach(item => {
+      const email = typeof item === 'string' ? item : item.target;
+      if (email && email.includes('@')) {
+        emails.push(email.trim().toLowerCase());
+      }
+    });
+
+    if (emails.length === 0) {
+      showToast("No valid email addresses found to transfer.");
+      return;
+    }
+
+    onNavigateTab(targetTab, emails);
+    const destName = targetTab === 'validator' ? 'Email Validator' : targetTab === 'sorter' ? 'Country Sorter' : 'Composer';
+    showToast(`Moved ${emails.length.toLocaleString()} ${label ? `(${label})` : ''} leads to ${destName}!`);
+  };
+
+  // Multi-Category Actions
+  const handleSendSelectedToCompose = () => {
+    if (selectedCategoriesItems.length === 0) {
+      showToast("Please select at least one email server category to send.");
+      return;
+    }
+    const label = selectedComposeCategories.length === results.length
+      ? 'All MX Categories'
+      : `${selectedComposeCategories.length} Selected Categories (${selectedComposeCategories.join(', ')})`;
+    handleSendToCompose(selectedCategoriesItems, label);
+  };
+
+  const handleTransferSelectedToTab = (tab: string) => {
+    if (selectedCategoriesItems.length === 0) {
+      showToast("Please select at least one email server category to transfer.");
+      return;
+    }
+    const targets = selectedCategoriesItems.map(i => i.target);
+    const label = selectedComposeCategories.length === results.length
+      ? 'All MX Categories'
+      : `${selectedComposeCategories.length} Categories`;
+    handleTransferToTab(tab, targets, label);
+  };
+
+  const handleExportSelectedTxt = () => {
+    if (selectedCategoriesItems.length === 0) {
+      showToast("No email server categories selected to export.");
+      return;
+    }
+    const emails = selectedCategoriesItems.filter(i => i.target.includes('@')).map(i => i.target);
+    const dateStr = new Date().toISOString().split('T')[0];
+    const blob = new Blob([emails.join('\n')], { type: 'text/plain;charset=utf-8;' });
+    triggerBrowserDownload(blob, `MX_Selected_Categories_${dateStr}.txt`);
+    showToast(`Exported ${emails.length.toLocaleString()} emails from ${selectedComposeCategories.length} categories.`);
+  };
+
+  const handleExportSelectedCsv = () => {
+    if (selectedCategoriesItems.length === 0) {
+      showToast("No email server categories selected to export.");
+      return;
+    }
+    const dateStr = new Date().toISOString().split('T')[0];
+    const header = "Target,Domain,MX_Provider,Type\n";
+    const rows = selectedCategoriesItems.map(i => 
+      `"${i.target.replace(/"/g, '""')}","${i.domain.replace(/"/g, '""')}","${i.provider.replace(/"/g, '""')}","${i.type}"`
+    ).join("\n");
+    const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
+    triggerBrowserDownload(blob, `MX_Selected_Categories_${dateStr}.csv`);
+    showToast(`Exported ${selectedCategoriesItems.length.toLocaleString()} items to CSV.`);
+  };
+
+  // Keep screen awake while resolving MX DNS queries, sorting, or streaming folder extraction
+  useActiveWakeLock(isProcessing || isScanningFolder, 'MX Sorter: Active Processing & DNS Resolution');
+  const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
+  const [statusText, setStatusText] = useState('Idle');
+  
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
+  const abortFolderScanRef = useRef<AbortController | null>(null);
+  const controlRef = useRef({ shouldStop: false, isPaused: false });
+  const domainCache = useRef<Map<string, string>>(new Map());
+
+  // Format file size
+  const formatBytes = (bytes: number): string => {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  };
+
+  // Recursively parse entries from dropped items (supports folders and nested subfolders)
+  const traverseFileSystemEntry = async (entry: any): Promise<File[]> => {
+    const files: File[] = [];
+    if (entry.isFile) {
+      const file = await new Promise<File>((resolve, reject) => entry.file(resolve, reject));
+      if (isSupportedFolderFile(file)) {
+        files.push(file);
+      }
+    } else if (entry.isDirectory) {
+      const dirReader = entry.createReader();
+      const readAllEntries = async (): Promise<any[]> => {
+        let allEntries: any[] = [];
+        let batch = await new Promise<any[]>((resolve, reject) => dirReader.readEntries(resolve, reject));
+        while (batch.length > 0) {
+          allEntries = allEntries.concat(batch);
+          batch = await new Promise<any[]>((resolve, reject) => dirReader.readEntries(resolve, reject));
+        }
+        return allEntries;
+      };
+
+      try {
+        const entries = await readAllEntries();
+        const subFilesPromises = entries.map(childEntry => traverseFileSystemEntry(childEntry));
+        const subFilesArrays = await Promise.all(subFilesPromises);
+        subFilesArrays.forEach(arr => files.push(...arr));
+      } catch (err) {
+        console.error("Error reading subdirectory:", err);
+      }
+    }
+    return files;
+  };
+
+  const handleToggleAutoDownload = (enabled: boolean) => {
+    setAutoDownloadZip(enabled);
+    localStorage.setItem('smile_auto_download_zip', enabled ? 'true' : 'false');
+    showToast(enabled ? "Auto-Download ZIP enabled: All MX categories will automatically download on completion." : "Auto-Download ZIP disabled.");
+  };
+
+  const handleOpenSecretVaultSave = () => {
+    if (results.length === 0) {
+      showToast("No MX categories available to save.");
+      return;
+    }
+    const categoriesMap: Record<string, string[]> = {};
+    let count = 0;
+    results.forEach(g => {
+      categoriesMap[g.provider] = g.emails;
+      count += g.emails.length;
+    });
+    setVaultInitialData(categoriesMap);
+    setVaultItemCount(count);
+    setShowVaultModal(true);
+  };
+
+  const handleOpenSecretVaultBrowse = () => {
+    setVaultInitialData(null);
+    setShowVaultModal(true);
+  };
+
+  // Handle uploaded file (Excel .xlsx/.xls, CSV .csv/.cvs, TXT .txt)
+  const processUploadedFile = async (file: File) => {
+    setIsReadingFile(true);
+    setStatusText(`Uploading ${file.name} to Zero-RAM Cloud Storage...`);
+    try {
+      const cloudRes = await uploadFileToCloudTemp(file, (pct) => {
+        setStatusText(`Uploading ${file.name} to Cloud Temp Storage (${pct}%)...`);
+      });
+
+      setTempFileId(cloudRes.tempId);
+      setTempFilename(cloudRes.filename);
+      setIsLargeFileMode(true);
+      rawFileContent.current = null;
+      setUploadedFile(null);
+      setUploadedFolder(null);
+
+      setInputText(
+        `[ZERO-RAM CLOUD FILE: ${cloudRes.filename}]\n` +
+        `Status: Held safely on server disk (Zero Browser RAM Used)\n` +
+        `File Size: ${cloudRes.sizeFormatted} | Total Records: ${cloudRes.totalLines.toLocaleString()}\n\n` +
+        `Preview (first 10 items):\n` +
+        `${cloudRes.previewLines.slice(0, 10).join('\n')}\n` +
+        `...plus ${(Math.max(0, cloudRes.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
+        `Ready to analyze MX records!`
+      );
+      showToast(`Uploaded ${cloudRes.filename} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Temp Storage!`);
+    } catch (err: any) {
+      console.warn("Cloud temp upload failed, falling back to local file reader:", err);
+      try {
+        const extracted = await extractTargetsForMXFromFile(file, (stats) => {
+          setStatusText(stats.status || `Reading ${file.name} (${stats.percent}%)...`);
+        });
+        if (extracted.items.length === 0) {
+          showToast(`No email addresses or domain names found in ${file.name}.`);
+          return;
+        }
+
+        setUploadedFile(extracted);
+        setUploadedFolder(null);
+
+        const isLarge = file.size > 80 * 1024 || extracted.items.length > 400;
+        setIsLargeFileMode(isLarge);
+
+        if (isLarge) {
+          rawFileContent.current = extracted.items.join('\n');
+          setInputText(
+            `[LOADED: ${file.name}]\n` +
+            `Format: ${extracted.fileType.toUpperCase()} | Size: ${formatBytes(file.size)}\n` +
+            `Targets Found: ${extracted.totalUnique.toLocaleString()} (${extracted.emailsCount.toLocaleString()} emails, ${extracted.domainsCount.toLocaleString()} domains)\n\n` +
+            `Preview (first 10 items):\n${extracted.items.slice(0, 10).join('\n')}\n` +
+            `...plus ${(extracted.items.length - 10).toLocaleString()} more items.\n\n` +
+            `Ready to analyze MX records!`
+          );
+        } else {
+          rawFileContent.current = null;
+          setInputText(extracted.items.join('\n'));
+        }
+
+        showToast(`Loaded ${extracted.totalUnique.toLocaleString()} targets from ${file.name}`);
+      } catch (innerErr: any) {
+        showToast(innerErr?.message || `Failed to process ${file.name}`);
+      }
+    } finally {
+      setIsReadingFile(false);
+      setStatusText('Idle');
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  // Process all files within a selected or dropped folder
+  const processFolderFiles = async (filesList: File[], defaultFolderName?: string) => {
+    if (!filesList || filesList.length === 0) {
+      showToast("No files found in selected folder.");
+      return;
+    }
+
+    let inferredFolderName = defaultFolderName;
+    if (!inferredFolderName) {
+      const sampleWithRelPath = filesList.find(f => (f as any).webkitRelativePath);
+      if (sampleWithRelPath && (sampleWithRelPath as any).webkitRelativePath) {
+        inferredFolderName = (sampleWithRelPath as any).webkitRelativePath.split('/')[0];
+      }
+    }
+    const folderName = inferredFolderName || 'Selected Folder';
+
+    setIsScanningFolder(true);
+    setStatusText(`Scanning folder "${folderName}" (${filesList.length} files)...`);
+    setFolderScanProgress({ current: 0, total: filesList.length, emailsCount: 0, currentFileName: 'Initializing...' });
+    
+    abortFolderScanRef.current = new AbortController();
+
+    try {
+      const result = await extractTargetsFromFolderFiles(
+        filesList,
+        folderName,
+        (prog) => {
+          setFolderScanProgress(prog);
+          setStatusText(`Scanning ${prog.current}/${prog.total}: ${prog.emailsCount.toLocaleString()} emails found...`);
+        },
+        abortFolderScanRef.current.signal
+      );
+
+      if (result.items.length === 0) {
+        showToast(`No email addresses or targets found across ${result.totalFiles} files in "${folderName}".`);
+        return;
+      }
+
+      setUploadedFolder(result);
+      setUploadedFile(null);
+
+      const isLarge = result.totalSize > 150 * 1024 || result.items.length > 500;
+      setIsLargeFileMode(isLarge);
+
+      if (isLarge) {
+        rawFileContent.current = result.items.join('\n');
+        setInputText(
+          `[LOADED FOLDER: ${result.folderName}]\n` +
+          `Files Scanned: ${result.totalFiles.toLocaleString()} (${result.filesWithTargets.toLocaleString()} files with contacts)\n` +
+          `Total Size: ${formatBytes(result.totalSize)}\n` +
+          `Extracted Targets: ${result.totalUnique.toLocaleString()} (${result.emailsCount.toLocaleString()} emails, ${result.domainsCount.toLocaleString()} domains)\n\n` +
+          `Preview (first 10 items):\n${result.items.slice(0, 10).join('\n')}\n` +
+          `...plus ${(result.items.length - 10).toLocaleString()} more items from folder.\n\n` +
+          `Ready to analyze MX records!`
+        );
+      } else {
+        rawFileContent.current = null;
+        setInputText(result.items.join('\n'));
+      }
+
+      showToast(`Extracted ${result.emailsCount.toLocaleString()} emails from folder "${result.folderName}"!`);
+    } catch (err: any) {
+      console.error("Error processing folder:", err);
+      showToast(err?.message || `Failed to process folder "${folderName}".`);
+    } finally {
+      setIsScanningFolder(false);
+      setFolderScanProgress(null);
+      setStatusText('Idle');
+      if (folderInputRef.current) folderInputRef.current.value = '';
+    }
+  };
+
+  const handleFileInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      await processUploadedFile(file);
+    }
+  };
+
+  const handleFolderInputChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files ? (Array.from(e.target.files) as File[]) : [];
+    if (files.length > 0) {
+      await processFolderFiles(files);
+    }
+  };
+
+  const handleCancelFolderScan = () => {
+    if (abortFolderScanRef.current) {
+      abortFolderScanRef.current.abort();
+      showToast("Cancelling folder scan...");
+    }
+  };
+
+  // Drag & Drop handlers
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!isDragging) setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+
+    // Support dropping folder directories directly
+    if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+      const entries: any[] = [];
+      for (let i = 0; i < e.dataTransfer.items.length; i++) {
+        const item = e.dataTransfer.items[i];
+        if (typeof item.webkitGetAsEntry === 'function') {
+          const entry = item.webkitGetAsEntry();
+          if (entry) entries.push(entry);
+        }
+      }
+
+      const hasDirectory = entries.some(entry => entry.isDirectory);
+      if (hasDirectory) {
+        const allFiles: File[] = [];
+        const rootFolderName = entries.find(entry => entry.isDirectory)?.name || 'Dropped Folder';
+        for (const entry of entries) {
+          const subFiles = await traverseFileSystemEntry(entry);
+          allFiles.push(...subFiles);
+        }
+        if (allFiles.length > 0) {
+          await processFolderFiles(allFiles, rootFolderName);
+          return;
+        }
+      }
+    }
+
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      const file = e.dataTransfer.files[0];
+      await processUploadedFile(file);
+    }
+  };
+
+  const handleClearFile = () => {
+    setUploadedFile(null);
+    setUploadedFolder(null);
+    setIsLargeFileMode(false);
+    rawFileContent.current = null;
+    setInputText('');
+    showToast("Cleared uploaded file.");
+  };
+
+  const handleClearFolder = () => {
+    setUploadedFolder(null);
+    setUploadedFile(null);
+    setIsLargeFileMode(false);
+    rawFileContent.current = null;
+    setInputText('');
+    showToast("Cleared loaded folder.");
+  };
+
+  // Query DNS over HTTPS for MX records (Google DoH with Cloudflare DoH fallback)
+  const fetchMX = async (domain: string): Promise<string> => {
+    if (domainCache.current.has(domain)) return domainCache.current.get(domain)!;
+
+    try {
+      const cleanDomain = domain.toLowerCase().trim();
+      let records: string[] = [];
+
+      // 1. Google DNS over HTTPS
+      const gRes = await safeFetchJson<any>(`https://dns.google/resolve?name=${encodeURIComponent(cleanDomain)}&type=MX`);
+      if (gRes.data && Array.isArray(gRes.data.Answer) && gRes.data.Answer.length > 0) {
+        records = gRes.data.Answer.map((ans: any) => (ans.data || '').toLowerCase());
+      } else {
+        // 2. Cloudflare DNS over HTTPS fallback
+        const cfRes = await safeFetchJson<any>(
+          `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(cleanDomain)}&type=MX`,
+          { headers: { Accept: 'application/dns-json' } }
+        );
+        if (cfRes.data && Array.isArray(cfRes.data.Answer) && cfRes.data.Answer.length > 0) {
+          records = cfRes.data.Answer.map((ans: any) => (ans.data || '').toLowerCase());
+        }
+      }
+      
+      if (records.length === 0) {
+        domainCache.current.set(domain, 'Private / Custom Server');
+        return 'Private / Custom Server';
+      }
+
+      let detectedProvider = 'Private / Custom Server';
+
+      for (const [provider, patterns] of Object.entries(MX_PATTERNS)) {
+        if (records.some(rec => patterns.some(p => rec.includes(p)))) {
+          detectedProvider = provider;
+          break;
+        }
+      }
+
+      domainCache.current.set(domain, detectedProvider);
+      return detectedProvider;
+    } catch {
+      return 'Private / Custom Server';
+    }
+  };
+
+  // Core MX Analysis Runner
+  const processEmails = async () => {
+    const contentToProcess = isLargeFileMode && rawFileContent.current 
+      ? rawFileContent.current 
+      : inputText;
+
+    if (!contentToProcess.trim()) {
+      showToast("Please enter emails or upload an Excel, CSV, or TXT file.");
+      return;
+    }
+
+    let rawLines: string[] = [];
+    if (tempFileId) {
+      setStatusText("Streaming records from Zero-RAM Cloud Temp Storage...");
+      const collected: string[] = [];
+      let offset = 0;
+      let hasMore = true;
+      while (hasMore) {
+        const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
+        for (const line of chunk.lines) {
+          const trimmed = line.trim();
+          if (trimmed && (trimmed.includes('@') || trimmed.includes('.'))) {
+            collected.push(trimmed);
+          }
+        }
+        offset = chunk.nextOffset;
+        hasMore = chunk.hasMore && chunk.lines.length > 0;
+        setStatusText(`Loaded ${collected.length.toLocaleString()} items from Cloud Temp Storage...`);
+      }
+      rawLines = collected;
+    } else {
+      rawLines = contentToProcess
+        .split(/[\r\n,;]+/)
+        .map(e => e.trim())
+        .filter(item => {
+          if (!item) return false;
+          // Ignore preview header lines from large file preview
+          if (item.startsWith('[LOADED:') || item.startsWith('[ZERO-RAM') || item.startsWith('Format:') || item.startsWith('Targets Found:') || item.startsWith('Preview') || item.startsWith('...plus') || item.startsWith('Ready to')) {
+            return false;
+          }
+          return true;
+        });
+    }
+
+    if (rawLines.length === 0) {
+      showToast("No valid input items found to process.");
+      return;
+    }
+
+    let targetItemsToProcess = rawLines;
+
+    // Apply Smart Clean Filter and Deduplication if enabled
+    // User requested: "remove all public email, banks, junk email like webmaster, user etc, but leave info, sales, order. remove .gov and edu etc. we have one clean resullts after seperations, consider removing dublicates"
+    if (enableAutoClean) {
+      const cleanResult = cleanAndDeduplicateTargets(rawLines, cleanFilterConfig);
+      targetItemsToProcess = cleanResult.cleanTargets;
+      setCleanStats(cleanResult.counts);
+      setExcludedItems(cleanResult.excludedTargets);
+
+      if (cleanResult.cleanTargets.length === 0) {
+        showToast(`All ${rawLines.length} items were filtered out based on your clean settings (Public emails, Banks, Junk users, or .Gov/.Edu). Check the Excluded tab.`);
+        setViewMode('excluded');
+        return;
+      }
+    } else {
+      // Basic deduplication if auto-clean is disabled but duplicate removal is requested
+      if (cleanFilterConfig.removeDuplicates) {
+        const uniqueSet = new Set(rawLines.map(l => l.toLowerCase()));
+        targetItemsToProcess = Array.from(uniqueSet);
+      }
+      setCleanStats(null);
+      setExcludedItems([]);
+    }
+
+    const domainMap = new Map<string, string[]>();
+
+    targetItemsToProcess.forEach(item => {
+      let domain = '';
+      let target = item;
+
+      if (item.includes('@')) {
+        const parts = item.split('@');
+        domain = (parts[1] || '').toLowerCase().trim();
+        target = item.toLowerCase().trim();
+      } else {
+        // Standalone domain or URL
+        let cleaned = item.replace(/^(?:https?:\/\/)?(?:www\.)?/i, '').split('/')[0].split('?')[0].split('#')[0].toLowerCase().trim();
+        cleaned = cleaned.replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, '');
+        if (cleaned.includes('.')) {
+          domain = cleaned;
+          target = cleaned;
+        }
+      }
+
+      if (domain && domain.includes('.')) {
+        if (!domainMap.has(domain)) {
+          domainMap.set(domain, []);
+        }
+        if (!domainMap.get(domain)!.includes(target)) {
+          domainMap.get(domain)!.push(target);
+        }
+      }
+    });
+
+    const domains: string[] = Array.from(domainMap.keys());
+    const totalDomains = domains.length;
+
+    if (totalDomains === 0) {
+      showToast("No valid email addresses or domains found to analyze.");
+      return;
+    }
+
+    setIsProcessing(true);
+    setIsPaused(false);
+    controlRef.current = { shouldStop: false, isPaused: false };
+    setResults([]);
+    setCleanConsolidatedList([]);
+    setSelectedCategory('all');
+    setSearchQuery('');
+    setViewMode('clean-consolidated');
+
+    const providerMap = new Map<string, string[]>();
+    const BATCH_SIZE = 12;
+
+    for (let i = 0; i < domains.length; i += BATCH_SIZE) {
+      if (controlRef.current.shouldStop) break;
+      while (controlRef.current.isPaused) {
+        await new Promise(r => setTimeout(r, 200));
+        if (controlRef.current.shouldStop) break;
+      }
+
+      const batch = domains.slice(i, i + BATCH_SIZE);
+      setProgress({ current: i, total: totalDomains });
+      setStatusText(`Querying MX records for ${batch.length} domains (batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(totalDomains / BATCH_SIZE)})...`);
+
+      const batchPromises = batch.map(async (domain: string) => {
+        const provider = await fetchMX(domain);
+        const targets = domainMap.get(domain)!;
+        if (!providerMap.has(provider)) providerMap.set(provider, []);
+        providerMap.get(provider)!.push(...targets);
+      });
+
+      await Promise.all(batchPromises);
+
+      // Live partial UI update
+      const currentGroups = Array.from(providerMap.entries()).map(([provider, emails]) => ({
+        provider,
+        emails: Array.from(new Set(emails))
+      })).sort((a, b) => b.emails.length - a.emails.length);
+
+      setResults(currentGroups);
+
+      // Build Clean Consolidated List
+      const consolidated: { target: string; domain: string; provider: string; type: 'email' | 'domain' }[] = [];
+      providerMap.forEach((targets, prov) => {
+        const uniqueInProv = Array.from(new Set(targets));
+        uniqueInProv.forEach(t => {
+          const isEmail = t.includes('@');
+          const d = isEmail ? t.split('@')[1] : t;
+          consolidated.push({
+            target: t,
+            domain: d,
+            provider: prov,
+            type: isEmail ? 'email' : 'domain'
+          });
+        });
+      });
+      setCleanConsolidatedList(consolidated);
+    }
+
+    setProgress({ current: totalDomains, total: totalDomains });
+    setIsProcessing(false);
+    setStatusText('Analysis Complete');
+
+    const totalTargetsResolved = Array.from(providerMap.values()).reduce((sum, list) => sum + list.length, 0);
+    showToast(`Categorized ${totalTargetsResolved.toLocaleString()} clean targets across ${providerMap.size} MX providers.`);
+
+    // Auto-Download ZIP if enabled
+    if (autoDownloadZip) {
+      handleExportZip();
+      setWasAutoDownloaded(true);
+    } else {
+      setWasAutoDownloaded(false);
+    }
+    setShowFinishModal(true);
+
+    // Clean up cloud temp storage file
+    if (tempFileId) {
+      deleteCloudTempFile(tempFileId);
+      setTempFileId(null);
+      setTempFilename(null);
+    }
+  };
+
+  // Helper: Trigger file download in browser
+  const triggerBrowserDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  // Export Clean Master List (TXT)
+  const handleExportCleanTxt = () => {
+    if (cleanConsolidatedList.length === 0) return;
+    const dateStr = new Date().toISOString().split('T')[0];
+    const header = `# Clean Business Contacts (Deduplicated)\n# Clean Count: ${cleanConsolidatedList.length}\n# Exported: ${new Date().toISOString()}\n\n`;
+    const content = header + cleanConsolidatedList.map(c => c.target).join('\n');
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8;' });
+    triggerBrowserDownload(blob, `Clean_Contacts_${dateStr}.txt`);
+    showToast(`Exported ${cleanConsolidatedList.length} clean contacts to TXT.`);
+  };
+
+  // Export Clean Master List (CSV)
+  const handleExportCleanCsv = () => {
+    if (cleanConsolidatedList.length === 0) return;
+    const dateStr = new Date().toISOString().split('T')[0];
+    const header = "Target,Domain,MX_Provider,Type\n";
+    const rows = cleanConsolidatedList.map(item =>
+      `"${item.target.replace(/"/g, '""')}","${item.domain.replace(/"/g, '""')}","${item.provider.replace(/"/g, '""')}","${item.type}"`
+    ).join("\n");
+    const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
+    triggerBrowserDownload(blob, `Clean_Contacts_${dateStr}.csv`);
+    showToast(`Exported ${cleanConsolidatedList.length} clean contacts to CSV.`);
+  };
+
+  // Export Clean Master List (Excel .xlsx)
+  const handleExportCleanExcel = () => {
+    if (cleanConsolidatedList.length === 0) return;
+    const dateStr = new Date().toISOString().split('T')[0];
+    const wb = XLSX.utils.book_new();
+
+    // Sheet 1: Clean Master Contacts
+    const cleanRows = cleanConsolidatedList.map(item => ({
+      'Contact / Target': item.target,
+      'Domain': item.domain,
+      'MX Provider': item.provider,
+      'Type': item.type === 'email' ? 'Email Address' : 'Domain',
+      'Clean Status': 'Verified Business'
+    }));
+    const cleanSheet = XLSX.utils.json_to_sheet(cleanRows);
+    XLSX.utils.book_append_sheet(wb, cleanSheet, "Clean Contacts");
+
+    // Sheet 2: Separation & Filter Summary
+    const summaryRows = [
+      { Metric: 'Clean Unique Targets', Count: cleanConsolidatedList.length },
+      { Metric: 'Duplicates Removed', Count: cleanStats?.duplicates || 0 },
+      { Metric: 'Public Webmails Filtered', Count: cleanStats?.publicWebmail || 0 },
+      { Metric: 'Banks / Financial Filtered', Count: cleanStats?.bank || 0 },
+      { Metric: 'Junk Emails Filtered (info/sales/order preserved)', Count: cleanStats?.junkUser || 0 },
+      { Metric: 'Government & Educational Filtered', Count: cleanStats?.govEdu || 0 },
+      { Metric: 'Total Original Inputs Evaluated', Count: cleanStats?.total || cleanConsolidatedList.length }
+    ];
+    const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+    XLSX.utils.book_append_sheet(wb, summarySheet, "Filter Summary");
+
+    // Sheet 3: Provider Breakdown
+    const providerCounts: { [p: string]: number } = {};
+    cleanConsolidatedList.forEach(c => {
+      providerCounts[c.provider] = (providerCounts[c.provider] || 0) + 1;
+    });
+    const providerRows = Object.entries(providerCounts)
+      .map(([provider, count]) => ({
+        'MX Provider': provider,
+        'Clean Targets': count,
+        'Share': `${((count / cleanConsolidatedList.length) * 100).toFixed(1)}%`
+      }))
+      .sort((a, b) => b['Clean Targets'] - a['Clean Targets']);
+    const providerSheet = XLSX.utils.json_to_sheet(providerRows);
+    XLSX.utils.book_append_sheet(wb, providerSheet, "MX Breakdown");
+
+    XLSX.writeFile(wb, `Clean_Contacts_${dateStr}.xlsx`);
+    showToast(`Exported ${cleanConsolidatedList.length} clean contacts to Excel (.xlsx)!`);
+  };
+
+  // Export Excluded Audit Log (CSV)
+  const handleExportExcludedCsv = () => {
+    if (excludedItems.length === 0) return;
+    const dateStr = new Date().toISOString().split('T')[0];
+    const header = "Excluded_Target,Category,Reason\n";
+    const rows = excludedItems.map(item =>
+      `"${item.item.replace(/"/g, '""')}","${item.category.replace(/"/g, '""')}","${item.reason.replace(/"/g, '""')}"`
+    ).join("\n");
+    const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
+    triggerBrowserDownload(blob, `Excluded_Contacts_Audit_${dateStr}.csv`);
+    showToast(`Exported ${excludedItems.length} excluded items to audit CSV.`);
+  };
+
+  // Copy All Clean Targets to Clipboard
+  const handleCopyCleanList = async () => {
+    if (cleanConsolidatedList.length === 0) return;
+    const text = cleanConsolidatedList.map(c => c.target).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey('clean-all');
+      setTimeout(() => setCopiedKey(null), 2000);
+      showToast(`Copied ${cleanConsolidatedList.length} clean unique contacts to clipboard!`);
+    } catch {
+      showToast("Clipboard write permission unavailable.");
+    }
+  };
+
+  // Export 1: ZIP of .txt files per category
+  const handleExportZip = async () => {
+    if (results.length === 0) return;
+    const zip = new JSZip();
+    const dateStr = new Date().toISOString().split('T')[0];
+    const folder = zip.folder(`MX_Categories_${dateStr}`);
+    if (!folder) return;
+
+    results.forEach(group => {
+      const safeName = group.provider.replace(/[^a-z0-9]/gi, '_');
+      const header = `# MX CATEGORY: ${group.provider}\n# Total Targets: ${group.emails.length}\n# Exported: ${new Date().toISOString()}\n\n`;
+      folder.file(`${safeName}.txt`, header + group.emails.join('\n'));
+    });
+
+    const blob = await zip.generateAsync({ type: "blob" });
+    triggerBrowserDownload(blob, `MX_Categories_${dateStr}.zip`);
+    showToast("Downloaded all categories as ZIP!");
+  };
+
+  // Export 2: Excel (.xlsx) spreadsheet with category sheets & metadata
+  const handleExportExcel = () => {
+    if (results.length === 0) return;
+    const dateStr = new Date().toISOString().split('T')[0];
+
+    const wb = XLSX.utils.book_new();
+
+    // Summary Sheet
+    const summaryRows = results.map(g => ({
+      'MX Provider': g.provider,
+      'Total Targets': g.emails.length,
+      'Share of Total': `${((g.emails.length / totalResultsCount) * 100).toFixed(1)}%`
+    }));
+    const summarySheet = XLSX.utils.json_to_sheet(summaryRows);
+    XLSX.utils.book_append_sheet(wb, summarySheet, "Summary");
+
+    // Master List Sheet
+    const masterRows: any[] = [];
+    results.forEach(group => {
+      group.emails.forEach(target => {
+        const domain = target.includes('@') ? target.split('@')[1] : target;
+        masterRows.push({
+          'Target Email / Domain': target,
+          'Domain': domain,
+          'MX Provider': group.provider,
+          'Identified On': dateStr
+        });
+      });
+    });
+
+    const masterSheet = XLSX.utils.json_to_sheet(masterRows);
+    XLSX.utils.book_append_sheet(wb, masterSheet, "All Targets");
+
+    XLSX.writeFile(wb, `MX_Categories_${dateStr}.xlsx`);
+    showToast("Exported MX Categories to Excel (.xlsx)!");
+  };
+
+  // Export 3: Clean CSV
+  const handleExportCSV = () => {
+    if (results.length === 0) return;
+    const dateStr = new Date().toISOString().split('T')[0];
+
+    const header = "Target,Domain,MX_Provider\n";
+    const rows = results.flatMap(g => 
+      g.emails.map(t => {
+        const dom = t.includes('@') ? t.split('@')[1] : t;
+        return `"${t.replace(/"/g, '""')}","${dom.replace(/"/g, '""')}","${g.provider.replace(/"/g, '""')}"`;
+      })
+    ).join("\n");
+
+    const blob = new Blob([header + rows], { type: 'text/csv;charset=utf-8;' });
+    triggerBrowserDownload(blob, `MX_Categories_${dateStr}.csv`);
+    showToast("Exported MX Categories to CSV!");
+  };
+
+  // Export single category as TXT
+  const handleExportCategoryTxt = (group: MXGroup) => {
+    const safeName = group.provider.replace(/[^a-z0-9]/gi, '_');
+    const content = `# MX Provider: ${group.provider}\n# Count: ${group.emails.length}\n\n` + group.emails.join('\n');
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8;' });
+    triggerBrowserDownload(blob, `${safeName}_emails.txt`);
+    showToast(`Downloaded ${group.provider} list.`);
+  };
+
+  // Copy category targets to clipboard
+  const handleCopyCategory = async (group: MXGroup) => {
+    try {
+      await navigator.clipboard.writeText(group.emails.join('\n'));
+      setCopiedKey(group.provider);
+      setTimeout(() => setCopiedKey(null), 2000);
+      showToast(`Copied ${group.emails.length} items from ${group.provider} to clipboard!`);
+    } catch (e) {
+      showToast("Clipboard write permission unavailable.");
+    }
+  };
+
+  // Copy all results
+  const handleCopyAll = async () => {
+    if (results.length === 0) return;
+    const text = results.map(g => `=== ${g.provider} (${g.emails.length}) ===\n${g.emails.join('\n')}`).join('\n\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey('all');
+      setTimeout(() => setCopiedKey(null), 2000);
+      showToast("Copied all categorized items to clipboard!");
+    } catch (e) {
+      showToast("Unable to copy to clipboard.");
+    }
+  };
+
+  // Computed summary metrics
+  const totalResultsCount = useMemo(() => {
+    return results.reduce((sum, g) => sum + g.emails.length, 0);
+  }, [results]);
+
+  // Filtered clean list by search query and category
+  const filteredCleanList = useMemo(() => {
+    let list = cleanConsolidatedList;
+    if (selectedCategory !== 'all') {
+      list = list.filter(item => item.provider === selectedCategory);
+    }
+    if (!searchQuery.trim()) return list;
+    const q = searchQuery.toLowerCase();
+    return list.filter(item =>
+      item.target.toLowerCase().includes(q) ||
+      item.domain.toLowerCase().includes(q) ||
+      item.provider.toLowerCase().includes(q)
+    );
+  }, [cleanConsolidatedList, selectedCategory, searchQuery]);
+
+  // Filtered excluded items by search query
+  const filteredExcludedItems = useMemo(() => {
+    if (!searchQuery.trim()) return excludedItems;
+    const q = searchQuery.toLowerCase();
+    return excludedItems.filter(item =>
+      item.item.toLowerCase().includes(q) ||
+      item.reason.toLowerCase().includes(q) ||
+      item.category.toLowerCase().includes(q)
+    );
+  }, [excludedItems, searchQuery]);
+
+  // Filtered results by category and search term
+  const filteredResults = useMemo(() => {
+    return results
+      .filter(g => selectedCategory === 'all' || g.provider === selectedCategory)
+      .map(g => {
+        if (!searchQuery.trim()) return g;
+        const q = searchQuery.toLowerCase();
+        return {
+          ...g,
+          emails: g.emails.filter(e => e.toLowerCase().includes(q))
+        };
+      })
+      .filter(g => g.emails.length > 0);
+  }, [results, selectedCategory, searchQuery]);
+
+  const itemsToUploadToCloudDb = useMemo(() => {
+    if (results.length > 0) {
+      return results.flatMap(g => g.emails.map(e => {
+        const domain = e.includes('@') ? e.split('@')[1] : e;
+        return {
+          email: e.includes('@') ? e : `contact@${e}`,
+          companyName: domain.split('.')[0],
+          sourceUrl: `https://${domain}`,
+          isValid: true,
+          mxStatus: 'valid',
+          mxProvider: g.provider
+        };
+      }));
+    }
+    const raw = (isLargeFileMode && rawFileContent.current ? rawFileContent.current : inputText);
+    const emails: string[] = raw.split(/[\s,;]+/).map((e: string) => e.trim()).filter((e: string) => e.includes('@') || e.includes('.'));
+    const uniqueEmails: string[] = Array.from(new Set<string>(emails));
+    return uniqueEmails.map((e: string) => ({
+      email: e.includes('@') ? e : `contact@${e}`,
+      sourceUrl: e.includes('@') ? `https://${e.split('@')[1]}` : `https://${e}`
+    }));
+  }, [results, inputText, isLargeFileMode]);
+
+  const handleLoadLeadsFromCloudDb = (leads: ServerLead[], emails: string[]) => {
+    if (emails.length > 0) {
+      setInputText(emails.join('\n'));
+      setIsLargeFileMode(false);
+      rawFileContent.current = null;
+      showToast(`Loaded ${emails.length.toLocaleString()} leads from Cloud Database into MX Sorter!`);
+    }
+  };
+
+  const handleRunServerMxSort = async () => {
+    if (!currentUser) {
+      if (onOpenAuth) onOpenAuth();
+      else showToast('Please sign in to run tasks on the server engine.');
+      return;
+    }
+    const raw = (isLargeFileMode && rawFileContent.current ? rawFileContent.current : inputText);
+    const emails = Array.from(new Set(raw.split(/[\s,;]+/).map(e => e.trim()).filter(e => e.includes('@'))));
+    if (emails.length === 0) {
+      showToast('Enter emails in MX Sorter or load them from Cloud DB first.');
+      return;
+    }
+    try {
+      await serverApi.startJob({
+        type: 'mx_sort',
+        title: `MX Mailserver Sorter (${emails.length.toLocaleString()} emails)`,
+        config: {
+          emails
+        }
+      });
+      showToast('MX Mailserver sorting task started on server engine in background! Running zero-lag.');
+      if (onNavigateToServerJobs) {
+        onNavigateToServerJobs();
+      }
+    } catch (err: any) {
+      showToast(`Server MX job error: ${err.message}`);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Cloud Database Integration Bar */}
+      <CloudDbActionBar
+        tabName="MX Mailserver Sorter"
+        sourceTag="MX Sorted Contacts"
+        items={itemsToUploadToCloudDb}
+        currentUser={currentUser}
+        showToast={showToast}
+        onOpenAuth={onOpenAuth}
+        onLoadFromDb={handleLoadLeadsFromCloudDb}
+        onRunServerJob={handleRunServerMxSort}
+        serverJobLabel="Run MX Sorter on Server"
+      />
+
+      {/* Auto-Download All Categories ZIP & Secret Cloud Vault Action Bar */}
+      <AutoDownloadBar
+        autoDownloadZip={autoDownloadZip}
+        onToggleAutoDownload={handleToggleAutoDownload}
+        onDownloadAllZip={handleExportZip}
+        onOpenSecretVaultSave={handleOpenSecretVaultSave}
+        onOpenSecretVaultBrowse={handleOpenSecretVaultBrowse}
+        isTempCloudActive={Boolean(tempFileId)}
+        tempFilename={tempFilename || undefined}
+        totalItemsCount={results.reduce((acc, g) => acc + g.emails.length, 0)}
+        categoryLabel="MX Categories"
+        isProcessing={isProcessing}
+      />
+
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 h-full">
+        {/* LEFT PANEL: INPUT & CONTROLS */}
+        <div className="lg:col-span-4 flex flex-col h-full space-y-4">
+        <div className="bg-gray-800/50 backdrop-blur-sm border border-gray-700 rounded-xl shadow-2xl p-6 flex-grow flex flex-col">
+          <div className="mb-4 pb-3 border-b border-gray-700/60">
+            <h2 className="text-2xl font-bold text-white flex items-center gap-2">
+              <ArrowsRightLeftIcon className="w-6 h-6 text-blue-400" />
+              MX Provider Sorter
+            </h2>
+            <p className="text-gray-400 text-xs mt-1.5 leading-relaxed">
+              Identify host servers (Google Workspace, Microsoft 365, Zoho, etc.) for business emails and domains via live DNS MX lookup.
+            </p>
+          </div>
+
+          {/* DRAG & DROP UPLOAD ZONE (EXCEL, CSV, TXT, FOLDERS) */}
+          <div
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            className={`mb-4 p-4 rounded-xl border-2 border-dashed transition-all text-center ${
+              isDragging
+                ? 'border-blue-400 bg-blue-900/40 scale-[1.01]'
+                : uploadedFolder
+                ? 'border-teal-500/60 bg-teal-950/20'
+                : uploadedFile
+                ? 'border-emerald-500/60 bg-emerald-950/20'
+                : 'border-gray-600/80 bg-gray-900/40 hover:border-blue-500 hover:bg-gray-900/70'
+            }`}
+          >
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleFileInputChange}
+              accept=".xlsx,.xls,.csv,.cvs,.txt,text/plain,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+              className="hidden"
+            />
+            <input
+              type="file"
+              ref={folderInputRef}
+              onChange={handleFolderInputChange}
+              {...({
+                webkitdirectory: "",
+                directory: "",
+                multiple: true
+              } as any)}
+              className="hidden"
+            />
+
+            {isScanningFolder ? (
+              <div className="flex flex-col items-center gap-2 p-1" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-2 text-teal-300 font-bold text-sm animate-pulse">
+                  <FolderOpenIcon className="w-5 h-5 text-teal-400 animate-bounce" />
+                  <span>Scanning Folder: {folderScanProgress?.current || 0} / {folderScanProgress?.total || 0} files</span>
+                </div>
+                <p className="text-xs text-gray-300">
+                  <strong className="text-teal-400 font-mono">{(folderScanProgress?.emailsCount || 0).toLocaleString()}</strong> emails extracted so far...
+                </p>
+                {folderScanProgress?.currentFileName && (
+                  <p className="text-[11px] text-gray-400 truncate max-w-[280px] font-mono">
+                    Reading: {folderScanProgress.currentFileName}
+                  </p>
+                )}
+                <div className="w-full bg-gray-800 rounded-full h-1.5 mt-1 overflow-hidden">
+                  <div
+                    className="bg-teal-500 h-1.5 rounded-full transition-all duration-150"
+                    style={{
+                      width: `${folderScanProgress && folderScanProgress.total > 0 ? (folderScanProgress.current / folderScanProgress.total) * 100 : 0}%`
+                    }}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={handleCancelFolderScan}
+                  className="mt-2 text-xs px-3 py-1 rounded bg-red-900/60 hover:bg-red-800 text-red-200 border border-red-700/60 transition flex items-center gap-1.5"
+                >
+                  <StopIcon className="w-3.5 h-3.5" /> Stop Scan
+                </button>
+              </div>
+            ) : uploadedFolder ? (
+              <div className="flex flex-col items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-2 text-teal-300 font-bold text-sm">
+                  <FolderOpenIcon className="w-5 h-5 text-teal-400" />
+                  <span className="truncate max-w-[180px]" title={uploadedFolder.folderName}>{uploadedFolder.folderName}</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded font-mono font-bold bg-teal-900/80 text-teal-300 border border-teal-500/40">
+                    {uploadedFolder.filesWithTargets} / {uploadedFolder.totalFiles} files
+                  </span>
+                </div>
+                <p className="text-xs text-gray-300">
+                  <strong className="text-teal-400 font-mono">{uploadedFolder.emailsCount.toLocaleString()}</strong> emails ({uploadedFolder.totalUnique.toLocaleString()} unique targets) • {formatBytes(uploadedFolder.totalSize)}
+                </p>
+                <div className="flex flex-wrap items-center justify-center gap-2 mt-2">
+                  <button
+                    type="button"
+                    onClick={() => folderInputRef.current?.click()}
+                    className="text-xs px-2.5 py-1 rounded bg-teal-900/60 hover:bg-teal-800 text-teal-200 border border-teal-700/60 transition flex items-center gap-1"
+                  >
+                    <FolderOpenIcon className="w-3.5 h-3.5" /> Change Folder
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="text-xs px-2.5 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 transition flex items-center gap-1"
+                  >
+                    <DocumentArrowUpIcon className="w-3.5 h-3.5" /> Single File
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleClearFolder}
+                    className="text-xs px-2.5 py-1 rounded bg-red-900/50 hover:bg-red-800 text-red-300 border border-red-700 transition flex items-center gap-1"
+                  >
+                    <XCircleIcon className="w-3.5 h-3.5" /> Remove
+                  </button>
+                </div>
+              </div>
+            ) : uploadedFile ? (
+              <div className="flex flex-col items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                <div className="flex items-center gap-2 text-emerald-400 font-bold text-sm">
+                  <CheckIcon className="w-5 h-5" />
+                  <span className="truncate max-w-[200px]" title={uploadedFile.fileName}>{uploadedFile.fileName}</span>
+                  <span className="text-[10px] px-2 py-0.5 rounded uppercase font-mono font-bold bg-emerald-900/80 text-emerald-300 border border-emerald-500/40">
+                    {uploadedFile.fileType}
+                  </span>
+                </div>
+                <p className="text-xs text-gray-300">
+                  {uploadedFile.totalUnique.toLocaleString()} items ({uploadedFile.emailsCount.toLocaleString()} emails, {uploadedFile.domainsCount.toLocaleString()} domains) • {formatBytes(uploadedFile.fileSize)}
+                </p>
+                <div className="flex flex-wrap items-center justify-center gap-2 mt-2">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="text-xs px-2.5 py-1 rounded bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 transition flex items-center gap-1"
+                  >
+                    <DocumentArrowUpIcon className="w-3.5 h-3.5" /> Change File
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => folderInputRef.current?.click()}
+                    className="text-xs px-2.5 py-1 rounded bg-teal-900/60 hover:bg-teal-800 text-teal-200 border border-teal-700/60 transition flex items-center gap-1"
+                  >
+                    <FolderOpenIcon className="w-3.5 h-3.5" /> Select Folder
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleClearFile}
+                    className="text-xs px-2.5 py-1 rounded bg-red-900/50 hover:bg-red-800 text-red-300 border border-red-700 transition flex items-center gap-1"
+                  >
+                    <XCircleIcon className="w-3.5 h-3.5" /> Remove
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-2" onClick={(e) => e.stopPropagation()}>
+                <p className="text-xs font-semibold text-gray-300 mb-2.5">
+                  Import contacts from file or entire directory:
+                </p>
+                <div className="flex items-center justify-center gap-2.5 w-full max-w-xs mb-3">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="flex-1 py-2 px-2.5 rounded-lg bg-gray-800 hover:bg-gray-700 hover:border-blue-500/60 border border-gray-700 text-xs font-bold text-blue-400 flex items-center justify-center gap-1.5 transition shadow-sm group"
+                  >
+                    <DocumentArrowUpIcon className="w-4 h-4 text-blue-400 group-hover:scale-110 transition-transform" />
+                    <span>Select File</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => folderInputRef.current?.click()}
+                    className="flex-1 py-2 px-2.5 rounded-lg bg-teal-950/60 hover:bg-teal-900/80 hover:border-teal-400/80 border border-teal-700/60 text-xs font-bold text-teal-300 flex items-center justify-center gap-1.5 transition shadow-sm group"
+                  >
+                    <FolderOpenIcon className="w-4 h-4 text-teal-400 group-hover:scale-110 transition-transform" />
+                    <span>Select Folder</span>
+                  </button>
+                </div>
+                <p className="text-[11px] text-gray-400">
+                  Drag & drop single files or an entire folder here
+                </p>
+                <div className="flex flex-wrap items-center justify-center gap-1.5 mt-2">
+                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold bg-emerald-950/80 text-emerald-300 border border-emerald-700/50">
+                    .XLSX / .XLS
+                  </span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold bg-blue-950/80 text-blue-300 border border-blue-700/50">
+                    .CSV
+                  </span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold bg-purple-950/80 text-purple-300 border border-purple-700/50">
+                    .TXT
+                  </span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded font-mono font-semibold bg-teal-950/80 text-teal-300 border border-teal-700/50 flex items-center gap-1">
+                    📁 DIRECTORIES
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* MANUAL TEXT INPUT / PREVIEW AREA */}
+          <div className="flex items-center justify-between mb-1.5">
+            <span className="text-xs font-semibold text-gray-300">
+              {uploadedFolder ? 'Folder Content Preview' : uploadedFile ? 'File Content Preview' : 'Or Paste Emails / Domains:'}
+            </span>
+            {inputText && !isProcessing && (
+              <button
+                type="button"
+                onClick={() => { setInputText(''); setUploadedFile(null); setUploadedFolder(null); rawFileContent.current = null; }}
+                className="text-xs text-gray-400 hover:text-red-400 transition"
+              >
+                Clear
+              </button>
+            )}
+          </div>
+
+          <textarea
+            value={inputText}
+            onChange={(e) => {
+              if (isLargeFileMode) {
+                showToast("Large file mode active. Use 'Change File' or 'Remove' to reload.");
+                return;
+              }
+              setInputText(e.target.value);
+            }}
+            placeholder="ceo@microsoft.com&#10;sales@google.com&#10;admin@company.fr&#10;apple.com&#10;tesla.com"
+            className={`flex-grow w-full p-3.5 bg-gray-900/60 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 resize-none text-xs font-mono text-gray-300 custom-scrollbar mb-3 ${
+              isLargeFileMode ? 'opacity-80 bg-gray-950' : ''
+            }`}
+            disabled={isProcessing}
+            readOnly={isLargeFileMode}
+            rows={6}
+          />
+
+          {/* SMART CLEAN & DEDUPLICATION CONFIGURATION PANEL */}
+          <div className="mb-4 p-3 bg-gradient-to-br from-gray-900/90 to-indigo-950/40 border border-indigo-500/30 rounded-xl space-y-2.5 shadow-md">
+            <div className="flex items-center justify-between">
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={enableAutoClean}
+                  onChange={(e) => setEnableAutoClean(e.target.checked)}
+                  disabled={isProcessing}
+                  className="rounded border-gray-600 text-indigo-600 focus:ring-indigo-500 w-4 h-4 bg-gray-800"
+                />
+                <span className="text-xs font-bold text-indigo-300 flex items-center gap-1.5">
+                  🛡️ Clean Filter & Deduplication
+                </span>
+              </label>
+              <button
+                type="button"
+                onClick={() => setShowCleanConfig(!showCleanConfig)}
+                className="text-[11px] text-indigo-400 hover:text-indigo-200 underline font-medium"
+              >
+                {showCleanConfig ? 'Hide Rules' : 'Customize Rules'}
+              </button>
+            </div>
+
+            <p className="text-[11px] text-gray-400 leading-relaxed">
+              Filters public emails, banks, junk users (<code className="text-indigo-300">webmaster</code>, <code className="text-indigo-300">user</code>, etc. while preserving <code className="text-emerald-300">info</code>, <code className="text-emerald-300">sales</code>, <code className="text-emerald-300">order</code>), removes .gov/.edu, and removes duplicates.
+            </p>
+
+            {/* Quick Badge Indicators */}
+            <div className="flex flex-wrap gap-1.5 pt-0.5">
+              <span className={`text-[10px] px-2 py-0.5 rounded font-mono border transition ${
+                enableAutoClean && cleanFilterConfig.removePublicEmails
+                  ? 'bg-red-950/60 text-red-300 border-red-800/60'
+                  : 'bg-gray-800 text-gray-500 border-gray-700 line-through'
+              }`}>
+                No Public Webmail (@gmail.co, .fr, etc.)
+              </span>
+              <span className={`text-[10px] px-2 py-0.5 rounded font-mono border transition ${
+                enableAutoClean && cleanFilterConfig.removeBanks
+                  ? 'bg-amber-950/60 text-amber-300 border-amber-800/60'
+                  : 'bg-gray-800 text-gray-500 border-gray-700 line-through'
+              }`}>
+                No Banks/Finance
+              </span>
+              <span className={`text-[10px] px-2 py-0.5 rounded font-mono border transition ${
+                enableAutoClean && cleanFilterConfig.removeJunkBotEmails
+                  ? 'bg-purple-950/60 text-purple-300 border-purple-800/60'
+                  : 'bg-gray-800 text-gray-500 border-gray-700 line-through'
+              }`}>
+                No Junk Users (Keeps Info/Sales/Order)
+              </span>
+              <span className={`text-[10px] px-2 py-0.5 rounded font-mono border transition ${
+                enableAutoClean && cleanFilterConfig.removeGovEdu
+                  ? 'bg-blue-950/60 text-blue-300 border-blue-800/60'
+                  : 'bg-gray-800 text-gray-500 border-gray-700 line-through'
+              }`}>
+                No .Gov/.Edu
+              </span>
+              <span className={`text-[10px] px-2 py-0.5 rounded font-mono border transition ${
+                enableAutoClean && cleanFilterConfig.removeDuplicates
+                  ? 'bg-emerald-950/60 text-emerald-300 border-emerald-800/60'
+                  : 'bg-gray-800 text-gray-500 border-gray-700 line-through'
+              }`}>
+                Deduplicated
+              </span>
+            </div>
+
+            {/* EXPANDABLE INDIVIDUAL RULES CHECKLIST */}
+            {showCleanConfig && (
+              <div className="pt-2 border-t border-gray-800 space-y-2 text-xs">
+                <label className="flex items-center gap-2 cursor-pointer text-gray-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={cleanFilterConfig.removePublicEmails}
+                    onChange={(e) => setCleanFilterConfig(prev => ({ ...prev, removePublicEmails: e.target.checked }))}
+                    disabled={!enableAutoClean || isProcessing}
+                    className="rounded border-gray-600 text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5 bg-gray-800"
+                  />
+                  <span>Remove all public emails (@gmail.co, @gmail.fr, ending with .fr, .anything)</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-gray-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={cleanFilterConfig.removeBanks}
+                    onChange={(e) => setCleanFilterConfig(prev => ({ ...prev, removeBanks: e.target.checked }))}
+                    disabled={!enableAutoClean || isProcessing}
+                    className="rounded border-gray-600 text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5 bg-gray-800"
+                  />
+                  <span>Remove banks and financial institutions (Chase, Citi, .bank, etc.)</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-gray-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={cleanFilterConfig.removeJunkBotEmails}
+                    onChange={(e) => setCleanFilterConfig(prev => ({ ...prev, removeJunkBotEmails: e.target.checked }))}
+                    disabled={!enableAutoClean || isProcessing}
+                    className="rounded border-gray-600 text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5 bg-gray-800"
+                  />
+                  <span>Remove junk/bot users (webmaster, user, admin — leaves info, sales, order)</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-gray-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={cleanFilterConfig.removeGovEdu}
+                    onChange={(e) => setCleanFilterConfig(prev => ({ ...prev, removeGovEdu: e.target.checked }))}
+                    disabled={!enableAutoClean || isProcessing}
+                    className="rounded border-gray-600 text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5 bg-gray-800"
+                  />
+                  <span>Remove Government (.gov, .mil) & Education (.edu, .ac.*)</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer text-gray-300 hover:text-white">
+                  <input
+                    type="checkbox"
+                    checked={cleanFilterConfig.removeDuplicates}
+                    onChange={(e) => setCleanFilterConfig(prev => ({ ...prev, removeDuplicates: e.target.checked }))}
+                    disabled={!enableAutoClean || isProcessing}
+                    className="rounded border-gray-600 text-indigo-600 focus:ring-indigo-500 w-3.5 h-3.5 bg-gray-800"
+                  />
+                  <span>Remove duplicate contacts & domains (Normalized deduplication)</span>
+                </label>
+              </div>
+            )}
+          </div>
+
+          {/* ACTION BUTTONS & PROCESSING CONTROLS */}
+          <div className="flex gap-2">
+            {isProcessing ? (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const nextPaused = !isPaused;
+                    setIsPaused(nextPaused);
+                    controlRef.current.isPaused = nextPaused;
+                  }}
+                  className={`px-4 py-2.5 rounded-lg text-sm font-bold flex-1 flex items-center justify-center border transition-all ${
+                    isPaused
+                      ? 'bg-emerald-600 hover:bg-emerald-700 text-white border-emerald-500'
+                      : 'bg-yellow-600 hover:bg-yellow-700 text-white border-yellow-500'
+                  }`}
+                >
+                  {isPaused ? <PlayIcon className="w-4 h-4 mr-2" /> : <PauseIcon className="w-4 h-4 mr-2" />}
+                  {isPaused ? 'Resume' : 'Pause'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { controlRef.current.shouldStop = true; }}
+                  className="px-4 py-2.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-bold flex-1 flex items-center justify-center border border-red-500 transition-all"
+                >
+                  <StopIcon className="w-4 h-4 mr-2" /> Stop
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={processEmails}
+                disabled={!inputText.trim() || isReadingFile || isScanningFolder}
+                className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold shadow-lg shadow-blue-900/30 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2"
+              >
+                <ArrowsRightLeftIcon className="w-4 h-4" />
+                {uploadedFolder
+                  ? `Start MX Analysis (${uploadedFolder.totalUnique.toLocaleString()} items from folder)`
+                  : uploadedFile 
+                  ? `Start MX Analysis (${uploadedFile.totalUnique.toLocaleString()} items)` 
+                  : 'Start MX Analysis'}
+              </button>
+            )}
+          </div>
+
+          {/* REALTIME DNS PROGRESS BAR */}
+          {isProcessing && progress && (
+            <div className="mt-4 p-3 bg-gray-900/80 rounded-lg border border-gray-700">
+              <div className="flex justify-between text-xs text-blue-300 mb-1.5 font-medium">
+                <span className="truncate max-w-[220px]">{statusText}</span>
+                <span>{Math.round((progress.current / progress.total) * 100)}%</span>
+              </div>
+              <div className="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
+                <div 
+                  className="bg-gradient-to-r from-blue-500 to-teal-400 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${Math.min(100, Math.round((progress.current / progress.total) * 100))}%` }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* RIGHT PANEL: MX CATEGORIES & CLEAN CONSOLIDATED RESULTS */}
+      <div className="lg:col-span-8 flex flex-col h-full">
+        <div className="bg-gray-800/40 backdrop-blur-md border border-gray-700 rounded-xl shadow-2xl flex flex-col h-[85vh]">
+          {/* HEADER BAR & TAB SELECTOR */}
+          <div className="p-4 sm:p-5 border-b border-gray-700/60 bg-gray-800/50 flex flex-wrap justify-between items-center gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-xl font-bold text-white">
+                  {viewMode === 'clean-consolidated' ? 'Clean Consolidated Results' : viewMode === 'categorized' ? 'MX Provider Categories' : 'Excluded & Filtered Audit'}
+                </h2>
+                {cleanConsolidatedList.length > 0 && (
+                  <span className="text-xs px-2.5 py-0.5 rounded-full font-bold bg-emerald-900/80 text-emerald-300 border border-emerald-500/40">
+                    {cleanConsolidatedList.length.toLocaleString()} clean targets
+                  </span>
+                )}
+              </div>
+              <p className="text-gray-400 text-xs mt-0.5">
+                {viewMode === 'clean-consolidated'
+                  ? 'Unified clean business contacts after separations, free of public mailboxes, banks, junk users & duplicate URLs'
+                  : viewMode === 'categorized'
+                  ? 'Target organizations grouped by host email server & enterprise mail gateway'
+                  : 'Complete audit log of filtered public webmails, banks, junk mailboxes, .gov/.edu, and duplicates'}
+              </p>
+            </div>
+
+            {/* TAB SELECTOR BUTTONS */}
+            <div className="flex items-center gap-1 bg-gray-900/80 p-1 rounded-lg border border-gray-700">
+              <button
+                type="button"
+                onClick={() => setViewMode('clean-consolidated')}
+                className={`text-xs px-3 py-1.5 rounded-md font-bold transition flex items-center gap-1.5 ${
+                  viewMode === 'clean-consolidated'
+                    ? 'bg-emerald-600 text-white shadow-md'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <span>⭐ Clean Results</span>
+                {cleanConsolidatedList.length > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-emerald-950 text-emerald-300 font-mono">
+                    {cleanConsolidatedList.length}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setViewMode('categorized')}
+                className={`text-xs px-3 py-1.5 rounded-md font-bold transition flex items-center gap-1.5 ${
+                  viewMode === 'categorized'
+                    ? 'bg-blue-600 text-white shadow-md'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <span>🗂️ Categories</span>
+                {results.length > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-blue-950 text-blue-300 font-mono">
+                    {results.length}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setViewMode('excluded')}
+                className={`text-xs px-3 py-1.5 rounded-md font-bold transition flex items-center gap-1.5 ${
+                  viewMode === 'excluded'
+                    ? 'bg-purple-600 text-white shadow-md'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                <span>🛡️ Excluded ({excludedItems.length})</span>
+              </button>
+            </div>
+          </div>
+
+          {/* MULTI-CATEGORY SELECTION & SEND TO COMPOSE / CROSS-TAB HUB */}
+          {(cleanConsolidatedList.length > 0 || results.length > 0) && (
+            <div className="p-3.5 bg-gradient-to-r from-blue-950/90 via-indigo-950/80 to-slate-900 border-b border-blue-900/60 space-y-3">
+              {/* TOP ROW: TITLE, SELECTION SUMMARY & ACTION BUTTONS */}
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  <span className="text-xs font-bold text-blue-300 flex items-center gap-1.5">
+                    <Send className="w-3.5 h-3.5 text-blue-400" />
+                    Mail Server Categories to Send:
+                  </span>
+                  <span className="text-xs px-2.5 py-1 rounded-full font-bold bg-blue-900/60 border border-blue-500/40 text-blue-200">
+                    {selectedComposeCategories.length === results.length && results.length > 0 ? (
+                      <span>⭐ All {results.length} Categories ({selectedEmailsCount.toLocaleString()} leads)</span>
+                    ) : selectedComposeCategories.length > 0 ? (
+                      <span>{selectedComposeCategories.length} of {results.length} Categories ({selectedEmailsCount.toLocaleString()} leads)</span>
+                    ) : (
+                      <span className="text-amber-300">⚠️ No categories selected</span>
+                    )}
+                  </span>
+
+                  {/* Bulk Selection Buttons */}
+                  <div className="flex items-center gap-1 text-xs">
+                    <button
+                      type="button"
+                      onClick={handleSelectAllCategories}
+                      className="px-2 py-0.5 rounded bg-blue-900/50 hover:bg-blue-800 text-blue-300 hover:text-white border border-blue-700/50 font-medium transition text-[11px]"
+                      title="Select all categories to send"
+                    >
+                      Select All
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleClearAllCategories}
+                      className="px-2 py-0.5 rounded bg-gray-800 hover:bg-gray-700 text-gray-400 hover:text-white border border-gray-700 font-medium transition text-[11px]"
+                      title="Deselect all categories"
+                    >
+                      Clear All
+                    </button>
+                  </div>
+                </div>
+
+                {/* Primary Actions for Selected Categories */}
+                <div className="flex items-center gap-2 flex-wrap">
+                  {onSendToEmailSender && (
+                    <button
+                      type="button"
+                      onClick={handleSendSelectedToCompose}
+                      disabled={selectedCategoriesItems.length === 0}
+                      className="flex items-center px-3.5 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold transition-all shadow-md hover:shadow-blue-600/30 border border-blue-400/60"
+                      title="Send all leads from selected categories to Email Compose (Email Sender)"
+                    >
+                      <Send className="w-3.5 h-3.5 mr-1.5" />
+                      <span>Send Selected to Compose ({selectedEmailsCount.toLocaleString()})</span>
+                    </button>
+                  )}
+
+                  {onNavigateTab && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleTransferSelectedToTab('validator')}
+                        disabled={selectedCategoriesItems.length === 0}
+                        className="flex items-center px-3 py-1.5 bg-emerald-950/70 hover:bg-emerald-800 disabled:opacity-40 text-emerald-300 hover:text-white rounded-lg text-xs font-bold transition border border-emerald-600/50"
+                        title="Transfer selected categories to Sorter & Validator tab"
+                      >
+                        <CheckIcon className="w-3.5 h-3.5 mr-1 text-emerald-400" />
+                        <span>To Validator</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleTransferSelectedToTab('sorter')}
+                        disabled={selectedCategoriesItems.length === 0}
+                        className="flex items-center px-3 py-1.5 bg-purple-950/70 hover:bg-purple-800 disabled:opacity-40 text-purple-300 hover:text-white rounded-lg text-xs font-bold transition border border-purple-600/50"
+                        title="Transfer selected categories to Country Sorter tab"
+                      >
+                        <GlobeAltIcon className="w-3.5 h-3.5 mr-1 text-purple-400" />
+                        <span>To Country Sort</span>
+                      </button>
+                    </>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={handleExportSelectedTxt}
+                    disabled={selectedCategoriesItems.length === 0}
+                    className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 hover:text-white rounded-lg text-xs font-medium border border-gray-700 transition"
+                    title="Export selected categories as .txt"
+                  >
+                    .TXT
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleExportSelectedCsv}
+                    disabled={selectedCategoriesItems.length === 0}
+                    className="px-2.5 py-1.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-40 text-gray-300 hover:text-white rounded-lg text-xs font-medium border border-gray-700 transition"
+                    title="Export selected categories as CSV"
+                  >
+                    CSV
+                  </button>
+                </div>
+              </div>
+
+              {/* INTERACTIVE CATEGORY PILLS WITH INLINE REMOVAL & RE-ADDING */}
+              <div className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-blue-900/40">
+                <span className="text-[11px] text-gray-400 shrink-0 mr-1 font-medium">Categories:</span>
+                {results.map(g => {
+                  const count = g.emails.filter(e => e.includes('@')).length;
+                  const isSelected = selectedComposeCategories.includes(g.provider);
+                  return (
+                    <div
+                      key={g.provider}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all ${
+                        isSelected
+                          ? 'bg-blue-600/90 text-white border border-blue-400 shadow-sm'
+                          : 'bg-gray-900/80 text-gray-400 hover:text-gray-200 border border-dashed border-gray-700'
+                      }`}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => handleToggleCategory(g.provider)}
+                        className="flex items-center gap-1.5 text-left focus:outline-none"
+                        title={isSelected ? `Click to deselect ${g.provider}` : `Click to include ${g.provider}`}
+                      >
+                        <span>{isSelected ? '✓' : '+'}</span>
+                        <span>{g.provider}</span>
+                        <span className={`text-[10px] px-1.5 py-0.2 rounded-full font-mono ${isSelected ? 'bg-blue-800 text-blue-200' : 'bg-gray-800 text-gray-400'}`}>
+                          {count.toLocaleString()}
+                        </span>
+                      </button>
+                      {isSelected && (
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleRemoveCategory(g.provider);
+                          }}
+                          className="hover:bg-blue-700/80 rounded p-0.5 text-blue-200 hover:text-white transition ml-0.5 leading-none"
+                          title={`Remove ${g.provider} from send queue`}
+                        >
+                          ✕
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* DYNAMIC SUB-BAR / EXPORT ACTIONS */}
+          <div className="p-3 bg-gray-900/70 border-b border-gray-800 flex flex-wrap items-center justify-between gap-2.5">
+            {/* SEARCH INPUT */}
+            <div className="relative w-full sm:w-64">
+              <MagnifyingGlassIcon className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={viewMode === 'excluded' ? 'Search excluded items...' : 'Search contacts or domains...'}
+                className="w-full pl-8 pr-7 py-1 text-xs bg-gray-800 border border-gray-700 rounded-lg text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                >
+                  <XCircleIcon className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* EXPORT OPTIONS DEPENDING ON ACTIVE TAB */}
+            {viewMode === 'clean-consolidated' && cleanConsolidatedList.length > 0 && (
+              <div className="flex items-center flex-wrap gap-2">
+                {onSendToEmailSender && (
+                  <button
+                    type="button"
+                    onClick={() => handleSendToCompose(filteredCleanList, selectedCategory !== 'all' ? selectedCategory : 'Clean Consolidated')}
+                    className="flex items-center px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-lg text-xs font-bold transition shadow-md border border-blue-400/50"
+                    title="Send clean business leads directly to Email Compose"
+                  >
+                    <Send className="w-3.5 h-3.5 mr-1.5 text-blue-200" />
+                    Send to Compose ({filteredCleanList.filter(c => c.type === 'email' || c.target.includes('@')).length})
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleExportCleanExcel}
+                  className="flex items-center px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded-lg text-xs font-bold transition shadow"
+                  title="Download clean contacts as Excel workbook"
+                >
+                  <DocumentArrowUpIcon className="w-3.5 h-3.5 mr-1.5" />
+                  Excel (.xlsx)
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportCleanCsv}
+                  className="flex items-center px-3 py-1.5 bg-teal-700 hover:bg-teal-600 text-white rounded-lg text-xs font-bold transition shadow"
+                  title="Download clean CSV"
+                >
+                  CSV
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportCleanTxt}
+                  className="flex items-center px-3 py-1.5 bg-blue-700 hover:bg-blue-600 text-white rounded-lg text-xs font-bold transition shadow"
+                  title="Download clean TXT"
+                >
+                  TXT
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCopyCleanList}
+                  className="flex items-center px-2.5 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-lg text-xs font-bold transition border border-gray-600"
+                  title="Copy all clean contacts to clipboard"
+                >
+                  {copiedKey === 'clean-all' ? (
+                    <CheckIcon className="w-3.5 h-3.5 text-green-400 mr-1" />
+                  ) : (
+                    <ClipboardIcon className="w-3.5 h-3.5 mr-1" />
+                  )}
+                  {copiedKey === 'clean-all' ? 'Copied' : 'Copy All Clean'}
+                </button>
+              </div>
+            )}
+
+            {viewMode === 'categorized' && results.length > 0 && (
+              <div className="flex items-center flex-wrap gap-2">
+                {onSendToEmailSender && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (selectedCategory !== 'all') {
+                        const grp = results.find(g => g.provider === selectedCategory);
+                        if (grp) handleSendToCompose(grp.emails, grp.provider);
+                      } else {
+                        handleSendToCompose(cleanConsolidatedList, 'All Providers');
+                      }
+                    }}
+                    className="flex items-center px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-lg text-xs font-bold transition shadow-md border border-blue-400/50"
+                    title="Send category leads to Email Compose"
+                  >
+                    <Send className="w-3.5 h-3.5 mr-1.5 text-blue-200" />
+                    Send to Compose ({selectedCategory !== 'all' ? (results.find(g => g.provider === selectedCategory)?.emails.filter(e => e.includes('@')).length || 0) : totalResultsCount})
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleExportExcel}
+                  className="flex items-center px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded-lg text-xs font-bold transition shadow"
+                  title="Download formatted Excel workbook"
+                >
+                  <DocumentArrowUpIcon className="w-3.5 h-3.5 mr-1.5" />
+                  Excel (.xlsx)
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportCSV}
+                  className="flex items-center px-3 py-1.5 bg-teal-700 hover:bg-teal-600 text-white rounded-lg text-xs font-bold transition shadow"
+                  title="Download CSV"
+                >
+                  CSV
+                </button>
+                <button
+                  type="button"
+                  onClick={handleExportZip}
+                  className="flex items-center px-3 py-1.5 bg-blue-700 hover:bg-blue-600 text-white rounded-lg text-xs font-bold transition shadow"
+                  title="Download individual category TXT files in ZIP"
+                >
+                  <FolderOpenIcon className="w-3.5 h-3.5 mr-1.5" />
+                  ZIP
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCopyAll}
+                  className="flex items-center px-2.5 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded-lg text-xs font-bold transition border border-gray-600"
+                  title="Copy all targets with provider headers"
+                >
+                  {copiedKey === 'all' ? (
+                    <CheckIcon className="w-3.5 h-3.5 text-green-400 mr-1" />
+                  ) : (
+                    <ClipboardIcon className="w-3.5 h-3.5 mr-1" />
+                  )}
+                  {copiedKey === 'all' ? 'Copied' : 'Copy All'}
+                </button>
+              </div>
+            )}
+
+            {viewMode === 'excluded' && excludedItems.length > 0 && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleExportExcludedCsv}
+                  className="flex items-center px-3 py-1.5 bg-purple-700 hover:bg-purple-600 text-white rounded-lg text-xs font-bold transition shadow"
+                >
+                  Download Excluded Log (.csv)
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* MAIN RESULTS DISPLAY AREA */}
+          <div className="flex-grow overflow-y-auto p-4 custom-scrollbar bg-gray-900/20">
+            {results.length === 0 && cleanConsolidatedList.length === 0 && excludedItems.length === 0 && !isProcessing ? (
+              <div className="flex flex-col items-center justify-center h-full text-gray-500 py-12">
+                <ArrowPathIcon className="w-14 h-14 mb-4 opacity-20 text-blue-400" />
+                <h3 className="text-base font-bold text-gray-300 mb-1">
+                  No Sorter Analysis Performed Yet
+                </h3>
+                <p className="text-xs text-gray-400 max-w-md text-center leading-relaxed">
+                  Upload your target list from <strong>Excel (.xlsx)</strong>, <strong>CSV</strong>, <strong>TXT</strong>, select an <strong>entire folder</strong>, or paste emails / domains on the left, then click <strong>Start MX Analysis</strong>.
+                </p>
+                <div className="mt-5 flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-3.5 py-1.5 rounded-lg bg-gray-800 hover:bg-gray-700 text-xs font-semibold text-blue-400 border border-gray-700 flex items-center gap-1.5 transition"
+                  >
+                    <DocumentArrowUpIcon className="w-4 h-4" />
+                    Upload Excel / CSV / TXT
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => folderInputRef.current?.click()}
+                    className="px-3.5 py-1.5 rounded-lg bg-teal-950/60 hover:bg-teal-900/80 text-xs font-semibold text-teal-300 border border-teal-700/60 flex items-center gap-1.5 transition shadow-sm"
+                  >
+                    <FolderOpenIcon className="w-4 h-4" />
+                    Select Entire Folder
+                  </button>
+                </div>
+              </div>
+            ) : viewMode === 'clean-consolidated' ? (
+              /* TAB 1: CLEAN CONSOLIDATED RESULTS VIEW */
+              <div className="space-y-4">
+                {/* CLEAN STATS BANNER */}
+                {cleanStats && (
+                  <div className="p-3.5 bg-emerald-950/40 border border-emerald-500/40 rounded-xl space-y-2">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <span className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
+                        ✓ Clean Separation & Deduplication Applied
+                      </span>
+                      <span className="text-[11px] font-mono text-gray-300">
+                        Evaluated {cleanStats.total.toLocaleString()} raw items → <strong className="text-emerald-400">{cleanConsolidatedList.length.toLocaleString()} clean unique business contacts</strong>
+                      </span>
+                    </div>
+
+                    <div className="flex flex-wrap gap-2 text-[10px] font-mono">
+                      <span className="px-2 py-0.5 rounded bg-emerald-900/60 text-emerald-200 border border-emerald-600/40">
+                        {cleanStats.duplicates.toLocaleString()} Duplicates Removed
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-red-950/60 text-red-300 border border-red-800/40">
+                        {cleanStats.publicWebmail.toLocaleString()} Public Webmails Filtered
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-amber-950/60 text-amber-300 border border-amber-800/40">
+                        {cleanStats.bank.toLocaleString()} Banks & Finance Filtered
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-purple-950/60 text-purple-300 border border-purple-800/40" title="Webmaster, user, admin filtered; info, sales, order kept">
+                        {cleanStats.junkUser.toLocaleString()} Junk Users Filtered (info/sales/order preserved)
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-blue-950/60 text-blue-300 border border-blue-800/40">
+                        {cleanStats.govEdu.toLocaleString()} .Gov & .Edu Filtered
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {/* CATEGORY FILTER PILLS FOR CLEAN LIST */}
+                <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar max-w-full pb-1">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCategory('all')}
+                    className={`text-xs px-2.5 py-1 rounded-full font-semibold transition whitespace-nowrap ${
+                      selectedCategory === 'all'
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-gray-800 text-gray-300 hover:bg-gray-700 hover:text-white'
+                    }`}
+                  >
+                    All Providers ({cleanConsolidatedList.length})
+                  </button>
+                  {results.map(group => (
+                    <button
+                      key={group.provider}
+                      type="button"
+                      onClick={() => setSelectedCategory(group.provider)}
+                      className={`text-xs px-2.5 py-1 rounded-full font-semibold transition whitespace-nowrap flex items-center gap-1 ${
+                        selectedCategory === group.provider
+                          ? 'bg-emerald-600 text-white'
+                          : 'bg-gray-800 text-gray-300 hover:bg-gray-700 hover:text-white'
+                      }`}
+                    >
+                      <span>{group.provider}</span>
+                      <span className="text-[10px] opacity-75">
+                        ({cleanConsolidatedList.filter(c => c.provider === group.provider).length})
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                {/* CLEAN CONTACTS TABLE */}
+                {filteredCleanList.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center p-8 text-gray-500">
+                    <p className="text-xs text-gray-400">No clean contacts match your filter.</p>
+                  </div>
+                ) : (
+                  <div className="bg-gray-900/60 border border-gray-800 rounded-xl overflow-hidden shadow-lg">
+                    <div className="grid grid-cols-12 px-4 py-2.5 bg-gray-900/90 border-b border-gray-800 text-xs font-bold text-gray-400 uppercase tracking-wider">
+                      <div className="col-span-5">Clean Contact / Target</div>
+                      <div className="col-span-3">Domain</div>
+                      <div className="col-span-3">MX Provider</div>
+                      <div className="col-span-1 text-right">Action</div>
+                    </div>
+                    <div className="divide-y divide-gray-800/80 max-h-[52vh] overflow-y-auto custom-scrollbar font-mono text-xs text-gray-300">
+                      {filteredCleanList.map((item, idx) => {
+                        const color = PROVIDER_COLORS[item.provider] || DEFAULT_COLOR;
+                        const isCopied = copiedKey === item.target;
+                        return (
+                          <div key={idx} className="grid grid-cols-12 px-4 py-2 hover:bg-gray-800/50 items-center transition">
+                            <div className="col-span-5 flex items-center gap-2 truncate font-medium text-emerald-300 select-all" title={item.target}>
+                              <span className="text-[10px] text-gray-500 font-mono w-6 text-right shrink-0">{idx + 1}.</span>
+                              <span className="truncate">{item.target}</span>
+                            </div>
+                            <div className="col-span-3 text-gray-400 truncate" title={item.domain}>
+                              {item.domain}
+                            </div>
+                            <div className="col-span-3">
+                              <span className={`inline-block text-[10px] px-2 py-0.5 rounded-full font-bold truncate max-w-full ${color.badge}`}>
+                                {item.provider}
+                              </span>
+                            </div>
+                            <div className="col-span-1 text-right flex items-center justify-end gap-1">
+                              {onSendToEmailSender && item.target.includes('@') && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSendToCompose([item], item.provider)}
+                                  className="p-1 text-blue-400 hover:text-white rounded hover:bg-blue-600 transition"
+                                  title="Send lead directly to Compose"
+                                >
+                                  <Send className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    await navigator.clipboard.writeText(item.target);
+                                    setCopiedKey(item.target);
+                                    setTimeout(() => setCopiedKey(null), 1500);
+                                  } catch {}
+                                }}
+                                className="p-1 text-gray-400 hover:text-white rounded hover:bg-gray-700 transition"
+                                title="Copy contact"
+                              >
+                                {isCopied ? (
+                                  <CheckIcon className="w-3.5 h-3.5 text-green-400" />
+                                ) : (
+                                  <ClipboardIcon className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ) : viewMode === 'categorized' ? (
+              /* TAB 2: CATEGORIZED PROVIDER CARDS VIEW */
+              <div className="space-y-4">
+                {/* CATEGORY FILTER PILLS */}
+                <div className="flex items-center gap-1.5 overflow-x-auto custom-scrollbar max-w-full pb-1">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCategory('all')}
+                    className={`text-xs px-2.5 py-1 rounded-full font-semibold transition whitespace-nowrap ${
+                      selectedCategory === 'all'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-800 text-gray-300 hover:bg-gray-700 hover:text-white'
+                    }`}
+                  >
+                    All ({totalResultsCount.toLocaleString()})
+                  </button>
+                  {results.map(group => (
+                    <button
+                      key={group.provider}
+                      type="button"
+                      onClick={() => setSelectedCategory(group.provider)}
+                      className={`text-xs px-2.5 py-1 rounded-full font-semibold transition whitespace-nowrap flex items-center gap-1 ${
+                        selectedCategory === group.provider
+                          ? 'bg-blue-600 text-white'
+                          : 'bg-gray-800 text-gray-300 hover:bg-gray-700 hover:text-white'
+                      }`}
+                    >
+                      <span>{group.provider}</span>
+                      <span className="text-[10px] opacity-75">({group.emails.length})</span>
+                    </button>
+                  ))}
+                </div>
+
+                {filteredResults.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center h-full text-gray-500 py-12">
+                    <p className="text-sm text-gray-400">No targets matched your search query.</p>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {filteredResults.map((group) => {
+                      const color = PROVIDER_COLORS[group.provider] || DEFAULT_COLOR;
+                      const isCopied = copiedKey === group.provider;
+
+                      return (
+                        <div
+                          key={group.provider}
+                          className={`${color.bg} border ${color.border} rounded-xl p-4 flex flex-col shadow-lg transition-all hover:border-blue-500/50`}
+                        >
+                          {/* CATEGORY CARD HEADER */}
+                          <div className="flex justify-between items-start mb-2.5 pb-2 border-b border-gray-700/50">
+                            <div>
+                              <div className="flex items-center gap-2">
+                                <label className="inline-flex items-center gap-1.5 cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedComposeCategories.includes(group.provider)}
+                                    onChange={() => handleToggleCategory(group.provider)}
+                                    className="rounded border-gray-600 bg-gray-900 text-blue-500 focus:ring-0 w-3.5 h-3.5"
+                                  />
+                                  <span className={`text-sm font-bold ${color.text}`}>
+                                    {group.provider}
+                                  </span>
+                                </label>
+                                <span className={`text-[11px] px-2 py-0.5 rounded-full font-mono font-bold ${color.badge}`}>
+                                  {group.emails.length.toLocaleString()}
+                                </span>
+                              </div>
+                              <span className="text-[10px] text-gray-400">
+                                {((group.emails.length / totalResultsCount) * 100).toFixed(1)}% of targets • {selectedComposeCategories.includes(group.provider) ? '✓ Included in queue' : 'Removed from queue'}
+                              </span>
+                            </div>
+
+                            {/* CARD ACTION BUTTONS */}
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              {onSendToEmailSender && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleSendToCompose(group.emails, group.provider)}
+                                  className="flex items-center gap-1 px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 text-white transition text-xs font-bold shadow-sm"
+                                  title={`Send ${group.provider} leads to Email Compose`}
+                                >
+                                  <Send className="w-3 h-3" />
+                                  <span>Compose</span>
+                                </button>
+                              )}
+                              {onNavigateTab && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleTransferToTab('validator', group.emails, group.provider)}
+                                  className="px-1.5 py-1 rounded bg-gray-800 hover:bg-emerald-950/70 text-emerald-300 hover:text-white transition text-xs font-semibold border border-gray-700 hover:border-emerald-600/50"
+                                  title={`Send ${group.provider} leads to Email Validator`}
+                                >
+                                  Validate
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleCopyCategory(group)}
+                                className="p-1.5 rounded bg-gray-800/80 hover:bg-gray-700 text-gray-300 hover:text-white transition text-xs border border-gray-700"
+                                title={`Copy ${group.provider} targets`}
+                              >
+                                {isCopied ? (
+                                  <CheckIcon className="w-3.5 h-3.5 text-green-400" />
+                                ) : (
+                                  <ClipboardIcon className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleExportCategoryTxt(group)}
+                                className="p-1.5 rounded bg-gray-800/80 hover:bg-gray-700 text-gray-300 hover:text-white transition text-xs border border-gray-700"
+                                title={`Download ${group.provider} as TXT`}
+                              >
+                                <FolderOpenIcon className="w-3.5 h-3.5 text-blue-400" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* SCROLLABLE TARGETS LIST */}
+                          <div className="flex-grow h-40 overflow-y-auto font-mono text-[11px] text-gray-300 bg-gray-950/70 p-2.5 rounded-lg border border-gray-800 custom-scrollbar space-y-1">
+                            {group.emails.map((item, idx) => (
+                              <div
+                                key={idx}
+                                className="truncate hover:text-white hover:bg-gray-800/50 px-1 py-0.5 rounded transition select-all"
+                                title={item}
+                              >
+                                {item}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            ) : (
+              /* TAB 3: EXCLUDED & FILTERED AUDIT VIEW */
+              <div className="space-y-4">
+                <div className="p-3 bg-purple-950/40 border border-purple-600/40 rounded-xl flex items-center justify-between text-xs text-purple-200">
+                  <span>
+                    Excluded targets filtered by business quality rules (public webmails, financial banks, junk users like webmaster/user, gov/edu, or duplicate entries).
+                  </span>
+                  <span className="font-bold font-mono text-purple-300">
+                    {excludedItems.length} Excluded
+                  </span>
+                </div>
+
+                {filteredExcludedItems.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center p-8 text-gray-500">
+                    <p className="text-xs text-gray-400">No excluded items found.</p>
+                  </div>
+                ) : (
+                  <div className="bg-gray-900/60 border border-gray-800 rounded-xl overflow-hidden shadow-lg">
+                    <div className="grid grid-cols-12 px-4 py-2.5 bg-gray-900/90 border-b border-gray-800 text-xs font-bold text-gray-400 uppercase tracking-wider">
+                      <div className="col-span-5">Excluded Item / Target</div>
+                      <div className="col-span-3">Category</div>
+                      <div className="col-span-4">Reason</div>
+                    </div>
+                    <div className="divide-y divide-gray-800/80 max-h-[55vh] overflow-y-auto custom-scrollbar font-mono text-xs text-gray-300">
+                      {filteredExcludedItems.map((item, idx) => (
+                        <div key={idx} className="grid grid-cols-12 px-4 py-2 hover:bg-gray-800/40 items-center transition">
+                          <div className="col-span-5 truncate text-red-300 select-all" title={item.item}>
+                            <span className="text-[10px] text-gray-500 w-6 inline-block">{idx + 1}.</span>
+                            {item.item}
+                          </div>
+                          <div className="col-span-3">
+                            <span className="inline-block text-[10px] px-2 py-0.5 rounded-full font-bold bg-purple-950 text-purple-300 border border-purple-800/50 uppercase">
+                              {item.category.replace('_', ' ')}
+                            </span>
+                          </div>
+                          <div className="col-span-4 text-gray-400 text-[11px] truncate" title={item.reason}>
+                            {item.reason}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Auto-Download Completion & Secret Vault Prompt Modal */}
+      <AutoDownloadFinishModal
+        isOpen={showFinishModal}
+        onClose={() => setShowFinishModal(false)}
+        title="MX Provider Sorter"
+        totalItems={results.reduce((acc, g) => acc + g.emails.length, 0)}
+        categoriesCount={results.length}
+        autoDownloaded={wasAutoDownloaded}
+        onDownloadZip={handleExportZip}
+        onOpenSecretVault={handleOpenSecretVaultSave}
+      />
+
+      {/* Secret Cloud Vault Modal */}
+      <SecretCloudVaultModal
+        isOpen={showVaultModal}
+        onClose={() => setShowVaultModal(false)}
+        initialData={vaultInitialData}
+        defaultVaultName={`MX_Sorted_${results.length}_Providers_${new Date().toISOString().slice(0, 10)}`}
+        category="MX Sorter"
+        itemCount={vaultItemCount}
+        onDataLoaded={(data, vaultName) => {
+          if (typeof data === 'object' && !Array.isArray(data)) {
+            const groups: MXGroup[] = Object.entries(data).map(([provider, emails]) => ({
+              provider,
+              emails: Array.isArray(emails) ? emails : [String(emails)]
+            }));
+            setResults(groups);
+            showToast(`Loaded "${vaultName}" from Secret Cloud Vault into MX Sorter!`);
+          } else if (Array.isArray(data)) {
+            setInputText(data.join('\n'));
+            showToast(`Loaded "${vaultName}" from Secret Cloud Vault into Input!`);
+          }
+        }}
+      />
+    </div>
+  </div>
+  );
+};
+
+export default MXSorter;
