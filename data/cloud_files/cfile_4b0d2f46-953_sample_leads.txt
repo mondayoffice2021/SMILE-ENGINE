@@ -1,0 +1,6 @@
+user1@bmw.de
+user2@siemens.com
+info@mercedes-benz.com
+sales@volkswagen.de
+contact@toyota.co.jp
+support@airbus.fr

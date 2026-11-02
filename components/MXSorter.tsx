@@ -37,6 +37,10 @@ import { AutoDownloadFinishModal } from './AutoDownloadFinishModal';
 import { SecretCloudVaultModal } from './SecretCloudVaultModal';
 import { downloadCategoriesAsZip } from '../services/exportZip';
 import { uploadFileToCloudTemp, deleteCloudTempFile, fetchLinesFromCloudTemp } from '../services/cloudTempStorageClient';
+import { CloudFileHubBar } from './CloudFileHubBar';
+import { SessionRecoveryBanner } from './SessionRecoveryBanner';
+import { saveSessionCheckpoint, clearSessionCheckpoint, type SessionCheckpoint } from '../services/checkpointClient';
+import { uploadToCloudFiles, type CloudFileRecord } from '../services/cloudFilesClient';
 
 interface MXSorterProps {
   showToast: (msg: string) => void;
@@ -424,34 +428,102 @@ const MXSorter: React.FC<MXSorterProps> = ({
     setShowVaultModal(true);
   };
 
+  const [checkpointRefreshKey, setCheckpointRefreshKey] = useState<number>(0);
+
+  const handleSelectCloudFile = (cloudFile: CloudFileRecord) => {
+    setTempFileId(cloudFile.id);
+    setTempFilename(cloudFile.originalName);
+    setIsLargeFileMode(true);
+    rawFileContent.current = null;
+    setUploadedFile(null);
+    setUploadedFolder(null);
+
+    setInputText(
+      `[SHARED CLOUD FILE: ${cloudFile.originalName}]\n` +
+      `Status: Loaded from Cloud File Repository (Zero Browser RAM Used)\n` +
+      `File Size: ${cloudFile.sizeFormatted} | Total Records: ${cloudFile.totalLines.toLocaleString()}\n\n` +
+      `Preview (first 10 items):\n` +
+      `${cloudFile.previewLines.slice(0, 10).join('\n')}\n` +
+      `...plus ${(Math.max(0, cloudFile.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
+      `Ready to analyze MX records!`
+    );
+  };
+
+  const handleResumeCheckpoint = (cp: SessionCheckpoint) => {
+    if (cp.processedResults && Array.isArray(cp.processedResults)) {
+      setResults(cp.processedResults);
+      // Rebuild consolidated list
+      const consolidated: { target: string; domain: string; provider: string; type: 'email' | 'domain' }[] = [];
+      cp.processedResults.forEach((g: any) => {
+        (g.emails || []).forEach((t: string) => {
+          const isEmail = t.includes('@');
+          const d = isEmail ? t.split('@')[1] : t;
+          consolidated.push({
+            target: t,
+            domain: d,
+            provider: g.provider,
+            type: isEmail ? 'email' : 'domain'
+          });
+        });
+      });
+      setCleanConsolidatedList(consolidated);
+    }
+    if (cp.filterSummary) {
+      setCleanStats(cp.filterSummary);
+    }
+    if (cp.tempFileId) {
+      setTempFileId(cp.tempFileId);
+      setTempFilename(cp.sourceName);
+    }
+    showToast(`Restored ${cp.processedCount.toLocaleString()} targets from auto-save checkpoint!`);
+  };
+
+  const handleDownloadPartialCheckpointZip = async (cp: SessionCheckpoint) => {
+    if (cp.processedResults && Array.isArray(cp.processedResults)) {
+      const groups: MXGroup[] = cp.processedResults;
+      const entries: { filename: string; content: string }[] = [];
+      groups.forEach(g => {
+        entries.push({
+          filename: `${g.provider.replace(/[^a-zA-Z0-9.-]/g, '_')}_${g.emails.length}.txt`,
+          content: g.emails.join('\n')
+        });
+      });
+      await downloadCategoriesAsZip(`Interrupted_MX_Progress_${new Date().toISOString().slice(0, 10)}`, entries);
+      showToast("Exported currently processed MX categories as ZIP archive!");
+    } else {
+      showToast("No processed leads available in checkpoint to export.");
+    }
+  };
+
   // Handle uploaded file (Excel .xlsx/.xls, CSV .csv/.cvs, TXT .txt)
   const processUploadedFile = async (file: File) => {
     setIsReadingFile(true);
-    setStatusText(`Uploading ${file.name} to Zero-RAM Cloud Storage...`);
+    setStatusText(`Uploading ${file.name} to Cloud Server Repository...`);
     try {
-      const cloudRes = await uploadFileToCloudTemp(file, (pct) => {
-        setStatusText(`Uploading ${file.name} to Cloud Temp Storage (${pct}%)...`);
+      // Automatically upload to persistent Cloud File Hub
+      const cloudRes = await uploadToCloudFiles(file, 'mx-sorter', (pct) => {
+        setStatusText(`Uploading ${file.name} to Cloud Server Repository (${pct}%)...`);
       });
 
-      setTempFileId(cloudRes.tempId);
-      setTempFilename(cloudRes.filename);
+      setTempFileId(cloudRes.id);
+      setTempFilename(cloudRes.originalName);
       setIsLargeFileMode(true);
       rawFileContent.current = null;
       setUploadedFile(null);
       setUploadedFolder(null);
 
       setInputText(
-        `[ZERO-RAM CLOUD FILE: ${cloudRes.filename}]\n` +
-        `Status: Held safely on server disk (Zero Browser RAM Used)\n` +
+        `[CLOUD FILE STORED: ${cloudRes.originalName}]\n` +
+        `Status: Auto-Saved on Cloud Server Repository (Shared Across All Tabs • Zero Browser RAM)\n` +
         `File Size: ${cloudRes.sizeFormatted} | Total Records: ${cloudRes.totalLines.toLocaleString()}\n\n` +
         `Preview (first 10 items):\n` +
         `${cloudRes.previewLines.slice(0, 10).join('\n')}\n` +
         `...plus ${(Math.max(0, cloudRes.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
         `Ready to analyze MX records!`
       );
-      showToast(`Uploaded ${cloudRes.filename} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Temp Storage!`);
+      showToast(`Auto-uploaded ${cloudRes.originalName} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Server! Usable in all tabs.`);
     } catch (err: any) {
-      console.warn("Cloud temp upload failed, falling back to local file reader:", err);
+      console.warn("Cloud upload fallback to local file reader:", err);
       try {
         const extracted = await extractTargetsForMXFromFile(file, (stats) => {
           setStatusText(stats.status || `Reading ${file.name} (${stats.percent}%)...`);
@@ -711,23 +783,53 @@ const MXSorter: React.FC<MXSorterProps> = ({
 
     let rawLines: string[] = [];
     if (tempFileId) {
-      setStatusText("Streaming records from Zero-RAM Cloud Temp Storage...");
+      setStatusText("Streaming records from Zero-RAM Cloud Storage...");
       const collected: string[] = [];
       let offset = 0;
       let hasMore = true;
-      while (hasMore) {
-        const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
-        for (const line of chunk.lines) {
-          const trimmed = line.trim();
-          if (trimmed && (trimmed.includes('@') || trimmed.includes('.'))) {
-            collected.push(trimmed);
+      let streamFailed = false;
+
+      try {
+        while (hasMore) {
+          const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
+          for (const line of chunk.lines) {
+            const trimmed = line.trim();
+            if (trimmed && (trimmed.includes('@') || trimmed.includes('.'))) {
+              collected.push(trimmed);
+            }
           }
+          offset = chunk.nextOffset;
+          hasMore = chunk.hasMore && chunk.lines.length > 0;
+          setStatusText(`Loaded ${collected.length.toLocaleString()} items from Cloud Storage...`);
         }
-        offset = chunk.nextOffset;
-        hasMore = chunk.hasMore && chunk.lines.length > 0;
-        setStatusText(`Loaded ${collected.length.toLocaleString()} items from Cloud Temp Storage...`);
+        rawLines = collected;
+      } catch (streamErr: any) {
+        console.warn("MX Cloud streaming fallback:", streamErr?.message);
+        streamFailed = true;
+        setTempFileId(null);
+        setTempFilename(null);
       }
-      rawLines = collected;
+
+      if (streamFailed || rawLines.length === 0) {
+        const fallbackText = rawFileContent.current || contentToProcess;
+        rawLines = fallbackText
+          .split(/[\r\n,;]+/)
+          .map(e => e.trim())
+          .filter(item => {
+            if (!item) return false;
+            if (item.startsWith('[') || item.startsWith('Format:') || item.startsWith('Targets Found:') || item.startsWith('Preview') || item.startsWith('...plus') || item.startsWith('Ready to')) {
+              return false;
+            }
+            return item.includes('@') || item.includes('.');
+          });
+
+        if (rawLines.length === 0) {
+          showToast("Temporary cloud file has expired or was removed. Please re-select your file or paste your emails.");
+          setIsProcessing(false);
+          setStatusText('Idle');
+          return;
+        }
+      }
     } else {
       rawLines = contentToProcess
         .split(/[\r\n,;]+/)
@@ -866,29 +968,67 @@ const MXSorter: React.FC<MXSorterProps> = ({
         });
       });
       setCleanConsolidatedList(consolidated);
+
+      // Auto-save checkpoint to server and local backup
+      saveSessionCheckpoint({
+        tab: 'mx-sorter',
+        title: `MX Sorter (${targetItemsToProcess.length.toLocaleString()} items)`,
+        sourceName: tempFilename || uploadedFile?.name || 'Uploaded Targets',
+        totalItems: totalDomains,
+        processedCount: Math.min(i + BATCH_SIZE, totalDomains),
+        percent: Math.round((Math.min(i + BATCH_SIZE, totalDomains) / totalDomains) * 100),
+        remainingItems: domains.slice(i + BATCH_SIZE),
+        processedResults: currentGroups,
+        filterSummary: cleanStats,
+        tempFileId: tempFileId || undefined,
+        tempFileOffset: i + BATCH_SIZE,
+        status: 'running'
+      });
     }
 
-    setProgress({ current: totalDomains, total: totalDomains });
-    setIsProcessing(false);
-    setStatusText('Analysis Complete');
-
-    const totalTargetsResolved = Array.from(providerMap.values()).reduce((sum, list) => sum + list.length, 0);
-    showToast(`Categorized ${totalTargetsResolved.toLocaleString()} clean targets across ${providerMap.size} MX providers.`);
-
-    // Auto-Download ZIP if enabled
-    if (autoDownloadZip) {
-      handleExportZip();
-      setWasAutoDownloaded(true);
+    if (controlRef.current.shouldStop) {
+      showToast("MX analysis stopped by user. Progress saved in checkpoint.");
+      saveSessionCheckpoint({
+        tab: 'mx-sorter',
+        title: `MX Sorter (Paused: ${results.reduce((a, g) => a + g.emails.length, 0)} items)`,
+        sourceName: tempFilename || uploadedFile?.name || 'Uploaded Targets',
+        totalItems: totalDomains,
+        processedCount: results.reduce((a, g) => a + g.emails.length, 0),
+        percent: Math.round((results.reduce((a, g) => a + g.emails.length, 0) / totalDomains) * 100),
+        remainingItems: domains.slice(results.reduce((a, g) => a + g.emails.length, 0)),
+        processedResults: results,
+        filterSummary: cleanStats,
+        tempFileId: tempFileId || undefined,
+        status: 'interrupted'
+      });
+      setCheckpointRefreshKey(prev => prev + 1);
     } else {
-      setWasAutoDownloaded(false);
-    }
-    setShowFinishModal(true);
+      setProgress({ current: totalDomains, total: totalDomains });
+      setIsProcessing(false);
+      setStatusText('Analysis Complete');
 
-    // Clean up cloud temp storage file
-    if (tempFileId) {
-      deleteCloudTempFile(tempFileId);
-      setTempFileId(null);
-      setTempFilename(null);
+      // Clear checkpoint on successful completion
+      clearSessionCheckpoint('mx-sorter');
+      setCheckpointRefreshKey(prev => prev + 1);
+
+      const totalTargetsResolved = Array.from(providerMap.values()).reduce((sum, list) => sum + list.length, 0);
+      showToast(`Categorized ${totalTargetsResolved.toLocaleString()} clean targets across ${providerMap.size} MX providers.`);
+
+      // Auto-Download ZIP if enabled
+      if (autoDownloadZip) {
+        handleExportZip();
+        setWasAutoDownloaded(true);
+      } else {
+        setWasAutoDownloaded(false);
+      }
+      setShowFinishModal(true);
+
+      // Clean up cloud temp storage file
+      if (tempFileId) {
+        deleteCloudTempFile(tempFileId);
+        setTempFileId(null);
+        setTempFilename(null);
+      }
     }
   };
 
@@ -1233,6 +1373,26 @@ const MXSorter: React.FC<MXSorterProps> = ({
         onLoadFromDb={handleLoadLeadsFromCloudDb}
         onRunServerJob={handleRunServerMxSort}
         serverJobLabel="Run MX Sorter on Server"
+      />
+
+      {/* Central Cloud File Hub (Shared Across All Tabs) */}
+      <CloudFileHubBar
+        currentTabName="MX Mailserver Sorter"
+        sourceTabId="mx-sorter"
+        activeFileId={tempFileId}
+        activeFileName={tempFilename}
+        onSelectFile={handleSelectCloudFile}
+        showToast={showToast}
+      />
+
+      {/* Automatic Session Recovery Banner (Resume When Disconnected or Turned Off) */}
+      <SessionRecoveryBanner
+        tab="mx-sorter"
+        tabLabel="MX Mailserver Sorter"
+        onResume={handleResumeCheckpoint}
+        onDownloadPartialZip={handleDownloadPartialCheckpointZip}
+        showToast={showToast}
+        triggerRefreshKey={checkpointRefreshKey}
       />
 
       {/* Auto-Download All Categories ZIP & Secret Cloud Vault Action Bar */}

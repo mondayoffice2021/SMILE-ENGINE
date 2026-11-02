@@ -30,6 +30,10 @@ import { AutoDownloadFinishModal } from './AutoDownloadFinishModal';
 import { SecretCloudVaultModal } from './SecretCloudVaultModal';
 import { downloadCategoriesAsZip } from '../services/exportZip';
 import { uploadFileToCloudTemp, deleteCloudTempFile, fetchLinesFromCloudTemp } from '../services/cloudTempStorageClient';
+import { CloudFileHubBar } from './CloudFileHubBar';
+import { SessionRecoveryBanner } from './SessionRecoveryBanner';
+import { uploadToCloudFiles, type CloudFileRecord } from '../services/cloudFilesClient';
+import { saveSessionCheckpoint, clearSessionCheckpoint, type SessionCheckpoint } from '../services/checkpointClient';
 
 interface EmailValidatorProps {
   showToast: (msg: string) => void;
@@ -233,33 +237,80 @@ const EmailValidator: React.FC<EmailValidatorProps> = ({
     setShowVaultModal(true);
   };
 
+  const [checkpointRefreshKey, setCheckpointRefreshKey] = useState<number>(0);
+
+  const handleSelectCloudFile = (cloudFile: CloudFileRecord) => {
+    setTempFileId(cloudFile.id);
+    setTempFilename(cloudFile.originalName);
+    setLargeFileMode(true);
+    rawFileContent.current = null;
+
+    setInputText(
+      `[SHARED CLOUD FILE: ${cloudFile.originalName}]\n` +
+      `Status: Loaded from Cloud File Repository (Zero Browser RAM Used)\n` +
+      `File Size: ${cloudFile.sizeFormatted} | Total Records: ${cloudFile.totalLines.toLocaleString()}\n\n` +
+      `Preview (first 10 items):\n` +
+      `${cloudFile.previewLines.slice(0, 10).join('\n')}\n` +
+      `...plus ${(Math.max(0, cloudFile.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
+      `Ready to validate!`
+    );
+  };
+
+  const handleResumeCheckpoint = (cp: SessionCheckpoint) => {
+    if (cp.processedResults && Array.isArray(cp.processedResults)) {
+      setVerifiedEmails(cp.processedResults);
+    }
+    if (cp.tempFileId) {
+      setTempFileId(cp.tempFileId);
+      setTempFilename(cp.sourceName);
+    }
+    showToast(`Restored ${cp.processedCount.toLocaleString()} validated emails from auto-save checkpoint!`);
+  };
+
+  const handleDownloadPartialCheckpointZip = async (cp: SessionCheckpoint) => {
+    if (cp.processedResults && Array.isArray(cp.processedResults)) {
+      const emails: VerifiedEmail[] = cp.processedResults;
+      const deliverable = emails.filter(e => e.status === 'Deliverable').map(e => e.email);
+      const risky = emails.filter(e => e.status === 'Risky').map(e => e.email);
+      const undeliverable = emails.filter(e => e.status === 'Undeliverable').map(e => e.email);
+      const entries: { filename: string; content: string }[] = [];
+      if (deliverable.length > 0) entries.push({ filename: `Deliverable_${deliverable.length}.txt`, content: deliverable.join('\n') });
+      if (risky.length > 0) entries.push({ filename: `Risky_${risky.length}.txt`, content: risky.join('\n') });
+      if (undeliverable.length > 0) entries.push({ filename: `Undeliverable_${undeliverable.length}.txt`, content: undeliverable.join('\n') });
+      await downloadCategoriesAsZip(`Interrupted_Validator_Progress_${new Date().toISOString().slice(0, 10)}`, entries);
+      showToast("Exported currently validated categories as ZIP archive!");
+    } else {
+      showToast("No processed leads available in checkpoint to export.");
+    }
+  };
+
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
       setIsProcessing(true);
-      setStatusText(`Uploading ${file.name} to Zero-RAM Cloud Storage...`);
+      setStatusText(`Uploading ${file.name} to Cloud Server Repository...`);
       try {
-        const cloudRes = await uploadFileToCloudTemp(file, (pct) => {
-          setStatusText(`Uploading ${file.name} to Cloud Temp Storage (${pct}%)...`);
+        const cloudRes = await uploadToCloudFiles(file, 'email-validator', (pct) => {
+          setStatusText(`Uploading ${file.name} to Cloud Server Repository (${pct}%)...`);
         });
 
-        setTempFileId(cloudRes.tempId);
-        setTempFilename(cloudRes.filename);
+        setTempFileId(cloudRes.id);
+        setTempFilename(cloudRes.originalName);
         setLargeFileMode(true);
         rawFileContent.current = null;
 
         setInputText(
-          `[ZERO-RAM CLOUD FILE: ${cloudRes.filename}]\n` +
-          `Status: Held safely on server disk (Zero Browser RAM Used)\n` +
+          `[CLOUD FILE STORED: ${cloudRes.originalName}]\n` +
+          `Status: Auto-Saved on Cloud Server Repository (Shared Across All Tabs • Zero Browser RAM)\n` +
           `File Size: ${cloudRes.sizeFormatted} | Total Records: ${cloudRes.totalLines.toLocaleString()}\n\n` +
           `Preview (first 10 items):\n` +
           `${cloudRes.previewLines.slice(0, 10).join('\n')}\n` +
           `...plus ${(Math.max(0, cloudRes.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
           `Ready to validate!`
         );
-        showToast(`Uploaded ${cloudRes.filename} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Temp Storage!`);
+        showToast(`Auto-uploaded ${cloudRes.originalName} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Server! Usable in all tabs.`);
       } catch (err: any) {
-        console.warn("Cloud temp upload failed, falling back to local file reader:", err);
+        console.warn("Cloud upload fallback to local file reader:", err);
         try {
           const emails = await extractEmailsFromFile(file, {
             onProgress: (stats) => setStatusText(`Reading ${file.name} (${stats.percent}%)...`)
@@ -459,23 +510,44 @@ const EmailValidator: React.FC<EmailValidatorProps> = ({
     // Extract genuine emails and candidates, filtering out pure words
     let uniqueEmails: string[] = [];
     if (tempFileId) {
-      setStatusText("Streaming records from Zero-RAM Cloud Temp Storage...");
+      setStatusText("Streaming records from Zero-RAM Cloud Storage...");
       const collected: string[] = [];
       let offset = 0;
       let hasMore = true;
-      while (hasMore) {
-        const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
-        for (const line of chunk.lines) {
-          const matches = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
-          if (matches) {
-            collected.push(...matches);
+      let streamFailed = false;
+
+      try {
+        while (hasMore) {
+          const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
+          for (const line of chunk.lines) {
+            const matches = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+            if (matches) {
+              collected.push(...matches);
+            }
           }
+          offset = chunk.nextOffset;
+          hasMore = chunk.hasMore && chunk.lines.length > 0;
+          setStatusText(`Loaded ${collected.length.toLocaleString()} emails from Cloud Storage...`);
         }
-        offset = chunk.nextOffset;
-        hasMore = chunk.hasMore && chunk.lines.length > 0;
-        setStatusText(`Loaded ${collected.length.toLocaleString()} emails from Cloud Temp Storage...`);
+        uniqueEmails = Array.from(new Set(collected.map(e => e.toLowerCase())));
+      } catch (streamErr: any) {
+        console.warn("Validator Cloud streaming fallback:", streamErr?.message);
+        streamFailed = true;
+        setTempFileId(null);
+        setTempFilename(null);
       }
-      uniqueEmails = Array.from(new Set(collected.map(e => e.toLowerCase())));
+
+      if (streamFailed || uniqueEmails.length === 0) {
+        const fallbackText = rawFileContent.current || contentToProcess;
+        uniqueEmails = extractValidEmailsFromInput(fallbackText);
+        
+        if (uniqueEmails.length === 0) {
+          showToast("Temporary cloud file has expired or was removed. Please re-select your file or paste your emails.");
+          setIsProcessing(false);
+          setStatusText('Idle');
+          return;
+        }
+      }
     } else {
       uniqueEmails = extractValidEmailsFromInput(contentToProcess);
     }
@@ -585,6 +657,19 @@ const EmailValidator: React.FC<EmailValidatorProps> = ({
         }));
 
         setVerifiedEmails([...liveList]);
+
+        // Auto-save checkpoint so user can resume if disconnected or turned off
+        saveSessionCheckpoint({
+          tab: 'email-validator',
+          title: 'Email Deliverability & MX Validation',
+          sourceName: tempFilename || 'Validated Email List',
+          tempFileId: tempFileId || undefined,
+          totalItems: uniqueEmails.length,
+          processedCount: Math.min(i + DNS_BATCH, needsDNS.length),
+          percent: Math.round((Math.min(i + DNS_BATCH, needsDNS.length) / Math.max(1, needsDNS.length)) * 100),
+          status: 'running',
+          processedResults: [...liveList]
+        });
       }
     }
 
@@ -644,6 +729,19 @@ const EmailValidator: React.FC<EmailValidatorProps> = ({
         }));
 
         setVerifiedEmails([...liveList]);
+
+        // Auto-save checkpoint so user can resume if disconnected or turned off
+        saveSessionCheckpoint({
+          tab: 'email-validator',
+          title: 'Email Deliverability & MX Validation',
+          sourceName: tempFilename || 'Validated Email List',
+          tempFileId: tempFileId || undefined,
+          totalItems: uniqueEmails.length,
+          processedCount: Math.min(i + SMTP_BATCH, emailsForSmtp.length),
+          percent: Math.round((Math.min(i + SMTP_BATCH, emailsForSmtp.length) / Math.max(1, emailsForSmtp.length)) * 100),
+          status: 'running',
+          processedResults: [...liveList]
+        });
       }
     }
 
@@ -692,6 +790,10 @@ const EmailValidator: React.FC<EmailValidatorProps> = ({
       setWasAutoDownloaded(false);
     }
     setShowFinishModal(true);
+
+    // Clear session checkpoint on successful completion
+    clearSessionCheckpoint('email-validator');
+    setCheckpointRefreshKey(prev => prev + 1);
 
     // Clean up cloud temp storage file
     if (tempFileId) {
@@ -1096,6 +1198,26 @@ const EmailValidator: React.FC<EmailValidatorProps> = ({
         onLoadFromDb={handleLoadLeadsFromCloudDb}
         onRunServerJob={handleRunServerValidation}
         serverJobLabel="Run Validator on Server Engine"
+      />
+
+      {/* Central Cloud File Hub (Shared Across All Tabs) */}
+      <CloudFileHubBar
+        currentTabName="Sorter & Validator"
+        sourceTabId="email-validator"
+        activeFileId={tempFileId}
+        activeFileName={tempFilename}
+        onSelectFile={handleSelectCloudFile}
+        showToast={showToast}
+      />
+
+      {/* Automatic Session Recovery Banner (Resume When Disconnected or Turned Off) */}
+      <SessionRecoveryBanner
+        tab="email-validator"
+        tabLabel="Sorter & Validator"
+        onResume={handleResumeCheckpoint}
+        onDownloadPartialZip={handleDownloadPartialCheckpointZip}
+        showToast={showToast}
+        triggerRefreshKey={checkpointRefreshKey}
       />
 
       {/* Auto-Download All Categories ZIP & Secret Cloud Vault Action Bar */}

@@ -1,0 +1,36 @@
+[
+  {
+    "id": "cfile_c080359e-dc2",
+    "originalName": "try try.txt",
+    "filePath": "/app/applet/data/cloud_files/cfile_c080359e-dc2_try_try.txt",
+    "fileSizeBytes": 62,
+    "sizeFormatted": "0.1 KB",
+    "totalLines": 2,
+    "previewLines": [
+      "mladenka.pejic@zlatnalaguna.com",
+      "contact@giancarlo-giannini.de"
+    ],
+    "uploadedBy": "anonymous",
+    "sourceTab": "country-sorter",
+    "createdAt": "2026-11-01T23:48:55.622Z"
+  },
+  {
+    "id": "cfile_4b0d2f46-953",
+    "originalName": "sample_leads.txt",
+    "filePath": "/app/applet/data/cloud_files/cfile_4b0d2f46-953_sample_leads.txt",
+    "fileSizeBytes": 113,
+    "sizeFormatted": "0.1 KB",
+    "totalLines": 6,
+    "previewLines": [
+      "user1@bmw.de",
+      "user2@siemens.com",
+      "info@mercedes-benz.com",
+      "sales@volkswagen.de",
+      "contact@toyota.co.jp",
+      "support@airbus.fr"
+    ],
+    "uploadedBy": "anonymous",
+    "sourceTab": "global",
+    "createdAt": "2026-11-01T23:52:46.741Z"
+  }
+]

@@ -37,6 +37,10 @@ import { AutoDownloadFinishModal } from './AutoDownloadFinishModal';
 import { SecretCloudVaultModal } from './SecretCloudVaultModal';
 import { downloadCategoriesAsZip } from '../services/exportZip';
 import { uploadFileToCloudTemp, deleteCloudTempFile, fetchLinesFromCloudTemp } from '../services/cloudTempStorageClient';
+import { CloudFileHubBar } from './CloudFileHubBar';
+import { SessionRecoveryBanner } from './SessionRecoveryBanner';
+import { saveSessionCheckpoint, clearSessionCheckpoint, type SessionCheckpoint } from '../services/checkpointClient';
+import { uploadToCloudFiles, type CloudFileRecord } from '../services/cloudFilesClient';
 
 interface EmailSorterProps {
   showToast: (msg: string) => void;
@@ -290,34 +294,174 @@ const EmailSorter: React.FC<EmailSorterProps> = ({
     setShowVaultModal(true);
   };
 
+  const [checkpointRefreshKey, setCheckpointRefreshKey] = useState<number>(0);
+
+  const handleSelectCloudFile = (cloudFile: CloudFileRecord) => {
+    setTempFileId(cloudFile.id);
+    setTempFilename(cloudFile.originalName);
+    setLargeFileMode(true);
+    rawFileContent.current = null;
+    setInputText(
+      `[SHARED CLOUD FILE: ${cloudFile.originalName}]\n` +
+      `Status: Loaded from Cloud File Repository (Zero Browser RAM Used)\n` +
+      `File Size: ${cloudFile.sizeFormatted} | Total Records: ${cloudFile.totalLines.toLocaleString()}\n\n` +
+      `Preview (first 10 items):\n` +
+      `${cloudFile.previewLines.slice(0, 10).join('\n')}\n` +
+      `...plus ${(Math.max(0, cloudFile.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
+      `Ready to sort by country!`
+    );
+  };
+
+  const resumeDomainResolution = async (
+    remainingDomains: string[],
+    priorResults: SortedGroup[],
+    priorAudit: [string, CountryResolutionItem][]
+  ) => {
+    if (remainingDomains.length === 0) return;
+    setIsProcessing(true);
+    setIsPaused(false);
+    controlRef.current = { shouldStop: false, isPaused: false };
+
+    const currentResultsMap = new Map<string, string[]>();
+    priorResults.forEach(g => currentResultsMap.set(g.country, [...g.emails]));
+    const currentAuditMap = new Map<string, CountryResolutionItem>(priorAudit);
+
+    const BATCH_SIZE = 20;
+    const totalRemaining = remainingDomains.length;
+
+    for (let i = 0; i < totalRemaining; i += BATCH_SIZE) {
+      if (controlRef.current.shouldStop) break;
+      while (controlRef.current.isPaused) {
+        await new Promise(r => setTimeout(r, 300));
+        if (controlRef.current.shouldStop) break;
+      }
+      if (controlRef.current.shouldStop) break;
+
+      const batch = remainingDomains.slice(i, i + BATCH_SIZE);
+      setProgress({ current: i + batch.length, total: totalRemaining });
+      setStatusText(`Resumed deep contact crawling (${i + batch.length}/${totalRemaining})...`);
+
+      const batchResults = new Map<string, string>();
+      const identified = await processBatchWithRetry(() =>
+        identifyCountriesForDomains(batch, { deepResolve: true })
+      );
+
+      if (identified) {
+        identified.forEach(item => {
+          currentAuditMap.set(item.domain.toLowerCase(), item);
+          if (item.country && item.country !== 'Unknown') {
+            batchResults.set(item.domain.toLowerCase(), item.country);
+          }
+        });
+        setDomainAuditMap(new Map(currentAuditMap));
+      }
+
+      batch.forEach(domain => {
+        const country = batchResults.get(domain) || 'Unknown';
+        if (!currentResultsMap.has(country)) {
+          currentResultsMap.set(country, []);
+        }
+        currentResultsMap.get(country)?.push(`contact@${domain}`);
+      });
+
+      const updatedResults: SortedGroup[] = Array.from(currentResultsMap.entries())
+        .map(([country, emails]) => ({ country, emails }))
+        .sort((a, b) => b.emails.length - a.emails.length);
+
+      setSortedResults(updatedResults);
+
+      // Save progressive checkpoint
+      saveSessionCheckpoint({
+        tab: 'country-sorter',
+        title: `Country Sorter (Resumed: ${i + batch.length}/${totalRemaining})`,
+        sourceName: tempFilename || 'Uploaded Leads',
+        totalItems: totalRemaining,
+        processedCount: i + batch.length,
+        percent: Math.round(((i + batch.length) / totalRemaining) * 100),
+        remainingItems: remainingDomains.slice(i + BATCH_SIZE),
+        processedResults: updatedResults,
+        auditEvidence: Array.from(currentAuditMap.entries()),
+        filterSummary: filterSummary,
+        tempFileId: tempFileId || undefined,
+        status: 'running'
+      });
+    }
+
+    setIsProcessing(false);
+    setStatusText('Idle');
+    clearSessionCheckpoint('country-sorter');
+    setCheckpointRefreshKey(prev => prev + 1);
+    showToast("Completed resumed country sorting session!");
+  };
+
+  const handleResumeCheckpoint = async (cp: SessionCheckpoint) => {
+    if (cp.processedResults && Array.isArray(cp.processedResults)) {
+      setSortedResults(cp.processedResults);
+    }
+    if (cp.auditEvidence && Array.isArray(cp.auditEvidence)) {
+      setDomainAuditMap(new Map(cp.auditEvidence));
+    }
+    if (cp.filterSummary) {
+      setFilterSummary(cp.filterSummary);
+    }
+    if (cp.tempFileId) {
+      setTempFileId(cp.tempFileId);
+      setTempFilename(cp.sourceName);
+    }
+    showToast(`Restored ${cp.processedCount.toLocaleString()} processed leads from auto-save checkpoint!`);
+    
+    // Automatically trigger remaining resolution if remaining domains exist
+    if (cp.remainingItems && cp.remainingItems.length > 0) {
+      showToast(`Continuing sorting for ${cp.remainingItems.length} remaining domains...`);
+      resumeDomainResolution(cp.remainingItems, cp.processedResults || [], cp.auditEvidence || []);
+    }
+  };
+
+  const handleDownloadPartialCheckpointZip = async (cp: SessionCheckpoint) => {
+    if (cp.processedResults && Array.isArray(cp.processedResults)) {
+      const groups: SortedGroup[] = cp.processedResults;
+      const entries: { filename: string; content: string }[] = [];
+      groups.forEach(g => {
+        entries.push({
+          filename: `${g.country.replace(/[^a-zA-Z0-9.-]/g, '_')}_${g.emails.length}.txt`,
+          content: g.emails.join('\n')
+        });
+      });
+      await downloadCategoriesAsZip(`Interrupted_Session_Progress_${new Date().toISOString().slice(0, 10)}`, entries);
+      showToast("Exported currently processed categories as ZIP archive!");
+    } else {
+      showToast("No processed leads available in checkpoint to export.");
+    }
+  };
+
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
       setIsProcessing(true);
-      setStatusText(`Uploading ${file.name} to Zero-RAM Cloud Storage...`);
+      setStatusText(`Uploading ${file.name} to Cloud Server Repository...`);
       try {
-        // Upload immediately to server disk to avoid browser RAM freezing
-        const cloudRes = await uploadFileToCloudTemp(file, (pct) => {
-          setStatusText(`Uploading ${file.name} to Cloud Temp Storage (${pct}%)...`);
+        // Automatically upload to persistent Cloud File Hub so it's available in all tabs
+        const cloudRes = await uploadToCloudFiles(file, 'country-sorter', (pct) => {
+          setStatusText(`Uploading ${file.name} to Cloud Server Repository (${pct}%)...`);
         });
 
-        setTempFileId(cloudRes.tempId);
-        setTempFilename(cloudRes.filename);
+        setTempFileId(cloudRes.id);
+        setTempFilename(cloudRes.originalName);
         setLargeFileMode(true);
         rawFileContent.current = null;
 
         setInputText(
-          `[ZERO-RAM CLOUD FILE: ${cloudRes.filename}]\n` +
-          `Status: Held safely on server disk (Zero Browser RAM Used)\n` +
+          `[CLOUD FILE STORED: ${cloudRes.originalName}]\n` +
+          `Status: Auto-Saved on Cloud Server Repository (Shared Across All Tabs • Zero Browser RAM)\n` +
           `File Size: ${cloudRes.sizeFormatted} | Total Records: ${cloudRes.totalLines.toLocaleString()}\n\n` +
           `Preview (first 10 items):\n` +
           `${cloudRes.previewLines.slice(0, 10).join('\n')}\n` +
           `...plus ${(Math.max(0, cloudRes.totalLines - 10)).toLocaleString()} more lines ready for instant processing!\n\n` +
           `Ready to sort by country!`
         );
-        showToast(`Uploaded ${cloudRes.filename} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Temp Storage!`);
+        showToast(`Auto-uploaded ${cloudRes.originalName} (${cloudRes.sizeFormatted}, ${cloudRes.totalLines.toLocaleString()} records) to Cloud Server! Usable in all tabs.`);
       } catch (err: any) {
-        console.warn("Cloud temp upload failed, falling back to local file reader:", err);
+        console.warn("Cloud upload fallback to local reader:", err);
         try {
           const emails = await extractEmailsFromFile(file, {
             onProgress: (stats) => setStatusText(`Reading ${file.name} (${stats.percent}%)...`)
@@ -597,23 +741,48 @@ const EmailSorter: React.FC<EmailSorterProps> = ({
       // 1. Parse Emails
       let uniqueEmails: string[] = [];
       if (tempFileId) {
-        setStatusText("Streaming records from Zero-RAM Cloud Temp Storage...");
+        setStatusText("Streaming records from Zero-RAM Cloud Storage...");
         const collected: string[] = [];
         let offset = 0;
         let hasMore = true;
-        while (hasMore) {
-          const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
-          for (const line of chunk.lines) {
-            const matches = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
-            if (matches) {
-              collected.push(...matches);
+        let streamFailed = false;
+
+        try {
+          while (hasMore) {
+            const chunk = await fetchLinesFromCloudTemp(tempFileId, offset, 5000);
+            for (const line of chunk.lines) {
+              const matches = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+              if (matches) {
+                collected.push(...matches);
+              }
             }
+            offset = chunk.nextOffset;
+            hasMore = chunk.hasMore && chunk.lines.length > 0;
+            setStatusText(`Loaded ${collected.length.toLocaleString()} emails from Cloud Storage...`);
           }
-          offset = chunk.nextOffset;
-          hasMore = chunk.hasMore && chunk.lines.length > 0;
-          setStatusText(`Loaded ${collected.length.toLocaleString()} emails from Cloud Temp Storage...`);
+          uniqueEmails = Array.from(new Set(collected));
+        } catch (streamErr: any) {
+          console.warn("Cloud streaming fallback:", streamErr?.message);
+          streamFailed = true;
+          setTempFileId(null);
+          setTempFilename(null);
         }
-        uniqueEmails = Array.from(new Set(collected));
+
+        if (streamFailed || uniqueEmails.length === 0) {
+          const fallbackText = rawFileContent.current || contentToProcess;
+          const rawEmails = fallbackText
+            .split(/[\s,;]+/)
+            .map(e => e.trim())
+            .filter(e => e.includes('@') && !e.startsWith('[') && !e.startsWith('Preview'));
+          uniqueEmails = Array.from(new Set(rawEmails));
+          
+          if (uniqueEmails.length === 0) {
+            showToast("Temporary cloud file has expired or was removed. Please re-select your file or paste your emails.");
+            setIsProcessing(false);
+            setStatusText('Idle');
+            return;
+          }
+        }
       } else {
         const rawEmails = contentToProcess.split(/[\s,;]+/).map(e => e.trim()).filter(e => e.includes('@'));
         uniqueEmails = Array.from(new Set(rawEmails));
@@ -787,15 +956,51 @@ const EmailSorter: React.FC<EmailSorterProps> = ({
             .sort((a, b) => b.emails.length - a.emails.length);
 
         setSortedResults(partialResults);
+
+        // Auto-save checkpoint to server and local backup
+        saveSessionCheckpoint({
+          tab: 'country-sorter',
+          title: `Country Sorter (${uniqueEmails.length.toLocaleString()} leads)`,
+          sourceName: tempFilename || 'Uploaded Leads',
+          totalItems: totalUnresolved,
+          processedCount: Math.min(i + BATCH_SIZE, totalUnresolved),
+          percent: Math.round((Math.min(i + BATCH_SIZE, totalUnresolved) / totalUnresolved) * 100),
+          remainingItems: unresolvedDomains.slice(i + BATCH_SIZE),
+          processedResults: partialResults,
+          auditEvidence: Array.from(currentAuditMap.entries()),
+          filterSummary: filterSummary,
+          tempFileId: tempFileId || undefined,
+          tempFileOffset: i + BATCH_SIZE,
+          status: 'running'
+        });
       }
 
       if (controlRef.current.shouldStop) {
-        showToast("Processing stopped by user.");
+        showToast("Processing stopped by user. Progress saved in checkpoint.");
+        saveSessionCheckpoint({
+          tab: 'country-sorter',
+          title: `Country Sorter (Paused: ${sortedResults.reduce((a, g) => a + g.emails.length, 0)} leads)`,
+          sourceName: tempFilename || 'Uploaded Leads',
+          totalItems: totalUnresolved,
+          processedCount: sortedResults.reduce((a, g) => a + g.emails.length, 0),
+          percent: Math.round((sortedResults.reduce((a, g) => a + g.emails.length, 0) / totalUnresolved) * 100),
+          remainingItems: unresolvedDomains.slice(sortedResults.reduce((a, g) => a + g.emails.length, 0)),
+          processedResults: sortedResults,
+          auditEvidence: Array.from(currentAuditMap.entries()),
+          filterSummary: filterSummary,
+          tempFileId: tempFileId || undefined,
+          status: 'interrupted'
+        });
+        setCheckpointRefreshKey(prev => prev + 1);
       } else {
         const filterMsg = enableBusinessFilter && filterSummary 
           ? ` (${filterSummary.excludedEmails.length} non-business excluded)` 
           : '';
         showToast(`Sorting complete! Processed ${emailsToProcess.length} business emails.${filterMsg}`);
+
+        // Clear checkpoint on successful completion
+        clearSessionCheckpoint('country-sorter');
+        setCheckpointRefreshKey(prev => prev + 1);
 
         // Auto-Download all categorized files as a ZIP archive if enabled
         if (autoDownloadZip) {
@@ -925,6 +1130,26 @@ const EmailSorter: React.FC<EmailSorterProps> = ({
         onLoadFromDb={handleLoadLeadsFromCloudDb}
         onRunServerJob={handleRunServerCountrySort}
         serverJobLabel="Run Sorter on Server Engine"
+      />
+
+      {/* Central Cloud File Hub (Shared Across All Tabs) */}
+      <CloudFileHubBar
+        currentTabName="Country Sorter"
+        sourceTabId="country-sorter"
+        activeFileId={tempFileId}
+        activeFileName={tempFilename}
+        onSelectFile={handleSelectCloudFile}
+        showToast={showToast}
+      />
+
+      {/* Automatic Session Recovery Banner (Resume When Disconnected or Turned Off) */}
+      <SessionRecoveryBanner
+        tab="country-sorter"
+        tabLabel="Country Sorter"
+        onResume={handleResumeCheckpoint}
+        onDownloadPartialZip={handleDownloadPartialCheckpointZip}
+        showToast={showToast}
+        triggerRefreshKey={checkpointRefreshKey}
       />
 
       {/* Auto-Download All Categories ZIP & Secret Cloud Vault Action Bar */}

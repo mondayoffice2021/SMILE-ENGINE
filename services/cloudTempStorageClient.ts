@@ -72,7 +72,11 @@ export async function fetchLinesFromCloudTemp(
   offset = 0,
   limit = 5000
 ): Promise<CloudTempChunk> {
-  const res = await fetch(`/api/cloud-temp/${encodeURIComponent(tempId)}/lines?offset=${offset}&limit=${limit}`);
+  let res = await fetch(`/api/cloud-temp/${encodeURIComponent(tempId)}/lines?offset=${offset}&limit=${limit}`);
+  if (!res.ok) {
+    // Fallback: check if stored in persistent cloud files repository
+    res = await fetch(`/api/cloud-files/${encodeURIComponent(tempId)}/lines?offset=${offset}&limit=${limit}`);
+  }
   if (!res.ok) {
     const errData = await res.json().catch(() => ({}));
     throw new Error(errData.error || `Failed to fetch lines (status ${res.status})`);

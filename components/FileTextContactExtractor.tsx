@@ -50,6 +50,8 @@ import { AutoDownloadFinishModal } from './AutoDownloadFinishModal';
 import { SecretCloudVaultModal } from './SecretCloudVaultModal';
 import { downloadCategoriesAsZip } from '../services/exportZip';
 import { uploadFileToCloudTemp, deleteCloudTempFile, fetchLinesFromCloudTemp } from '../services/cloudTempStorageClient';
+import { CloudFileHubBar } from './CloudFileHubBar';
+import { uploadToCloudFiles, fetchCloudFileLines, type CloudFileRecord } from '../services/cloudFilesClient';
 
 interface FileTextContactExtractorProps {
   showToast: (message: string) => void;
@@ -463,21 +465,43 @@ export const FileTextContactExtractor: React.FC<FileTextContactExtractorProps> =
     runExtraction();
   }, [selectedFiles, runExtraction]);
 
+  const handleSelectCloudFile = async (cloudFile: CloudFileRecord) => {
+    setTempFileId(cloudFile.id);
+    setTempFilename(cloudFile.originalName);
+    showToast(`Loading records from cloud file "${cloudFile.originalName}"...`);
+    try {
+      const res = await fetchCloudFileLines(cloudFile.id, 0, 10000);
+      if (res.lines.length > 0) {
+        setPastedText(res.lines.join('\n'));
+        setInputTab('paste');
+        showToast(`Loaded ${res.lines.length.toLocaleString()} records from Cloud File "${cloudFile.originalName}" into Extractor!`);
+      }
+    } catch (e: any) {
+      showToast(`Error reading cloud file: ${e.message}`);
+    }
+  };
+
   // Handle file selection
   const handleFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0) return;
-    const filesArray = Array.from(e.target.files);
+    const filesArray = Array.from(e.target.files) as File[];
     setSelectedFiles(prev => [...prev, ...filesArray]);
     showToast(`Loaded ${filesArray.length} file(s). Extracting contacts...`);
+    filesArray.forEach((f: File) => {
+      uploadToCloudFiles(f, 'file-text-extractor').catch(err => console.warn("Cloud repo auto-upload notice:", err));
+    });
     e.target.value = '';
   };
 
   // Handle folder selection
   const handleFolderSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!e.target.files || e.target.files.length === 0) return;
-    const filesArray = Array.from(e.target.files);
+    const filesArray = Array.from(e.target.files) as File[];
     setSelectedFiles(prev => [...prev, ...filesArray]);
     showToast(`Loaded ${filesArray.length} file(s) from folder. Extracting contacts...`);
+    filesArray.forEach((f: File) => {
+      uploadToCloudFiles(f, 'file-text-extractor').catch(err => console.warn("Cloud repo auto-upload notice:", err));
+    });
     e.target.value = '';
   };
 
@@ -504,13 +528,19 @@ export const FileTextContactExtractor: React.FC<FileTextContactExtractorProps> =
       if (directFiles.length > 0) {
         setSelectedFiles(prev => [...prev, ...directFiles]);
         showToast(`Loaded ${directFiles.length} file(s) from dropped items/folders.`);
+        directFiles.forEach((f: File) => {
+          uploadToCloudFiles(f, 'file-text-extractor').catch(err => console.warn("Cloud repo auto-upload notice:", err));
+        });
         return;
       }
     }
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      const filesArray = Array.from(e.dataTransfer.files);
+      const filesArray = Array.from(e.dataTransfer.files) as File[];
       setSelectedFiles(prev => [...prev, ...filesArray]);
       showToast(`Loaded ${filesArray.length} dropped file(s). Extracting contacts...`);
+      filesArray.forEach((f: File) => {
+        uploadToCloudFiles(f, 'file-text-extractor').catch(err => console.warn("Cloud repo auto-upload notice:", err));
+      });
     }
   };
 
@@ -859,6 +889,16 @@ export const FileTextContactExtractor: React.FC<FileTextContactExtractorProps> =
         showToast={showToast}
         onOpenAuth={onOpenAuth}
         onLoadFromDb={handleLoadLeadsFromCloudDb}
+      />
+
+      {/* Central Cloud File Hub (Shared Across All Tabs) */}
+      <CloudFileHubBar
+        currentTabName="File & Text Extractor"
+        sourceTabId="file-text-extractor"
+        activeFileId={tempFileId}
+        activeFileName={tempFilename}
+        onSelectFile={handleSelectCloudFile}
+        showToast={showToast}
       />
 
       {/* Auto-Download All Categories ZIP & Secret Cloud Vault Action Bar */}

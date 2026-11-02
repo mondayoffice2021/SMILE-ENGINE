@@ -10,9 +10,10 @@ const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 const EXPORTS_DIR = path.join(DATA_DIR, 'exports');
 const LEADS_DIR = path.join(DATA_DIR, 'leads');
 const TEMP_STORAGE_DIR = path.join(DATA_DIR, 'temp_storage');
+const CLOUD_FILES_DIR = path.join(DATA_DIR, 'cloud_files');
 
 // Ensure base directories exist
-for (const dir of [DATA_DIR, DB_DIR, UPLOADS_DIR, EXPORTS_DIR, LEADS_DIR, TEMP_STORAGE_DIR]) {
+for (const dir of [DATA_DIR, DB_DIR, UPLOADS_DIR, EXPORTS_DIR, LEADS_DIR, TEMP_STORAGE_DIR, CLOUD_FILES_DIR]) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -172,6 +173,38 @@ export interface TempFileRecord {
   createdAt: string;
 }
 
+export interface CloudFileRecord {
+  id: string;
+  originalName: string;
+  filePath: string;
+  fileSizeBytes: number;
+  sizeFormatted: string;
+  totalLines: number;
+  previewLines: string[];
+  uploadedBy?: string;
+  sourceTab?: string;
+  createdAt: string;
+}
+
+export interface SessionCheckpointRecord {
+  id: string;
+  tab: string;
+  title: string;
+  sourceName: string;
+  totalItems: number;
+  processedCount: number;
+  percent: number;
+  remainingItems?: string[];
+  processedResults?: any;
+  auditEvidence?: any;
+  filterSummary?: any;
+  tempFileId?: string;
+  tempFileOffset?: number;
+  status: 'running' | 'paused' | 'interrupted' | 'completed';
+  createdAt: string;
+  updatedAt: string;
+}
+
 // Atomic file store helper
 class JsonTable<T extends { id?: string; key?: string }> {
   private filePath: string;
@@ -257,6 +290,8 @@ const paymentsTable = new JsonTable<PaymentOrderRecord>('payments.json', 'id');
 const paymentSettingsTable = new JsonTable<PaymentSettingsRecord & { id: string }>('payment_settings.json', 'id');
 const vaultTable = new JsonTable<SecretVaultRecord>('secret_vault.json', 'id');
 const tempFilesTable = new JsonTable<TempFileRecord>('temp_files.json', 'id');
+const cloudFilesTable = new JsonTable<CloudFileRecord>('cloud_files.json', 'id');
+const checkpointsTable = new JsonTable<SessionCheckpointRecord>('checkpoints.json', 'id');
 
 // Helper for passwords
 export function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
@@ -1096,14 +1131,28 @@ export const dbTempStorage = {
     hasMore: boolean;
     nextOffset: number;
   }> {
-    const record = tempFilesTable.get(tempId);
-    if (!record || !fs.existsSync(record.filePath)) {
+    let filePath: string | undefined;
+    let totalLines = 0;
+
+    const tempRec = tempFilesTable.get(tempId);
+    if (tempRec && fs.existsSync(tempRec.filePath)) {
+      filePath = tempRec.filePath;
+      totalLines = tempRec.totalLines;
+    } else {
+      const cloudRec = cloudFilesTable.get(tempId);
+      if (cloudRec && fs.existsSync(cloudRec.filePath)) {
+        filePath = cloudRec.filePath;
+        totalLines = cloudRec.totalLines;
+      }
+    }
+
+    if (!filePath || !fs.existsSync(filePath)) {
       throw new Error('Temporary file not found or has expired');
     }
 
     const lines: string[] = [];
     let currentIndex = 0;
-    const fileStream = fs.createReadStream(record.filePath);
+    const fileStream = fs.createReadStream(filePath);
     const rl = readline.createInterface({
       input: fileStream,
       crlfDelay: Infinity
@@ -1123,10 +1172,10 @@ export const dbTempStorage = {
       }
     }
 
-    const hasMore = (offset + lines.length) < record.totalLines;
+    const hasMore = (offset + lines.length) < totalLines;
     return {
       lines,
-      totalLines: record.totalLines,
+      totalLines,
       offset,
       limit,
       hasMore,
@@ -1151,4 +1200,191 @@ export const dbTempStorage = {
   }
 };
 
-export { DATA_DIR, UPLOADS_DIR, EXPORTS_DIR, LEADS_DIR, TEMP_STORAGE_DIR };
+// Persistent Cloud Files Hub
+export const dbCloudFiles = {
+  async registerCloudFile(originalName: string, diskFilePath: string, sourceTab?: string, uploadedBy?: string): Promise<CloudFileRecord> {
+    const stat = fs.statSync(diskFilePath);
+    const fileId = `cfile_${crypto.randomUUID().slice(0, 12)}`;
+    const cleanName = originalName.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const destPath = path.join(CLOUD_FILES_DIR, `${fileId}_${cleanName}`);
+
+    if (diskFilePath !== destPath) {
+      fs.copyFileSync(diskFilePath, destPath);
+    }
+
+    let totalLines = 0;
+    const previewLines: string[] = [];
+    const fileStream = fs.createReadStream(destPath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity
+    });
+
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (trimmed) {
+        totalLines++;
+        if (previewLines.length < 50) {
+          previewLines.push(trimmed);
+        }
+      }
+    }
+
+    const sizeKb = (stat.size / 1024).toFixed(1);
+    const sizeFormatted = stat.size > 1024 * 1024
+      ? `${(stat.size / (1024 * 1024)).toFixed(2)} MB`
+      : `${sizeKb} KB`;
+
+    const record: CloudFileRecord = {
+      id: fileId,
+      originalName,
+      filePath: destPath,
+      fileSizeBytes: stat.size,
+      sizeFormatted,
+      totalLines,
+      previewLines,
+      uploadedBy,
+      sourceTab,
+      createdAt: new Date().toISOString()
+    };
+
+    cloudFilesTable.set(record.id, record);
+    return record;
+  },
+
+  listAll(): CloudFileRecord[] {
+    return cloudFilesTable.getAll().sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  },
+
+  getById(id: string): CloudFileRecord | undefined {
+    return cloudFilesTable.get(id);
+  },
+
+  async getChunk(fileId: string, offset: number = 0, limit: number = 5000): Promise<{
+    lines: string[];
+    totalLines: number;
+    offset: number;
+    limit: number;
+    hasMore: boolean;
+    nextOffset: number;
+  }> {
+    let filePath: string | undefined;
+    let totalLines = 0;
+
+    const cloudRec = cloudFilesTable.get(fileId);
+    if (cloudRec && fs.existsSync(cloudRec.filePath)) {
+      filePath = cloudRec.filePath;
+      totalLines = cloudRec.totalLines;
+    } else {
+      const tempRec = tempFilesTable.get(fileId);
+      if (tempRec && fs.existsSync(tempRec.filePath)) {
+        filePath = tempRec.filePath;
+        totalLines = tempRec.totalLines;
+      }
+    }
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      throw new Error('Cloud file not found');
+    }
+
+    const lines: string[] = [];
+    let currentIndex = 0;
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity
+    });
+
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      if (currentIndex >= offset && lines.length < limit) {
+        lines.push(trimmed);
+      }
+      currentIndex++;
+      if (lines.length >= limit) {
+        fileStream.destroy();
+        break;
+      }
+    }
+
+    const hasMore = (offset + lines.length) < totalLines;
+    return {
+      lines,
+      totalLines,
+      offset,
+      limit,
+      hasMore,
+      nextOffset: offset + lines.length
+    };
+  },
+
+  delete(id: string): boolean {
+    const record = cloudFilesTable.get(id);
+    if (!record) return false;
+    if (fs.existsSync(record.filePath)) {
+      try {
+        fs.unlinkSync(record.filePath);
+      } catch {}
+    }
+    return cloudFilesTable.delete(id);
+  }
+};
+
+// Automatic Session Checkpointing & Recovery
+export const dbCheckpoints = {
+  saveCheckpoint(checkpoint: Partial<SessionCheckpointRecord> & { tab: string }): SessionCheckpointRecord {
+    const now = new Date().toISOString();
+    const id = checkpoint.id || `ckpt_${checkpoint.tab}`;
+    const existing = checkpointsTable.get(id);
+
+    const record: SessionCheckpointRecord = {
+      id,
+      tab: checkpoint.tab,
+      title: checkpoint.title || `${checkpoint.tab} progress`,
+      sourceName: checkpoint.sourceName || existing?.sourceName || 'Workspace',
+      totalItems: checkpoint.totalItems ?? existing?.totalItems ?? 0,
+      processedCount: checkpoint.processedCount ?? existing?.processedCount ?? 0,
+      percent: checkpoint.percent ?? (checkpoint.totalItems ? Math.round(((checkpoint.processedCount || 0) / checkpoint.totalItems) * 100) : 0),
+      remainingItems: checkpoint.remainingItems || existing?.remainingItems || [],
+      processedResults: checkpoint.processedResults !== undefined ? checkpoint.processedResults : existing?.processedResults,
+      auditEvidence: checkpoint.auditEvidence !== undefined ? checkpoint.auditEvidence : existing?.auditEvidence,
+      filterSummary: checkpoint.filterSummary !== undefined ? checkpoint.filterSummary : existing?.filterSummary,
+      tempFileId: checkpoint.tempFileId || existing?.tempFileId,
+      tempFileOffset: checkpoint.tempFileOffset ?? existing?.tempFileOffset ?? 0,
+      status: checkpoint.status || 'running',
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    };
+
+    checkpointsTable.set(id, record);
+    return record;
+  },
+
+  getActive(tab?: string): SessionCheckpointRecord | undefined {
+    const all = checkpointsTable.getAll();
+    if (tab) {
+      return all.find(c => c.tab === tab && c.status !== 'completed');
+    }
+    return all.find(c => c.status !== 'completed');
+  },
+
+  listAll(): SessionCheckpointRecord[] {
+    return checkpointsTable.getAll().sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  },
+
+  delete(idOrTab: string): boolean {
+    const direct = checkpointsTable.get(idOrTab);
+    if (direct) {
+      return checkpointsTable.delete(idOrTab);
+    }
+    const byTab = checkpointsTable.find(c => c.tab === idOrTab);
+    if (byTab) {
+      return checkpointsTable.delete(byTab.id);
+    }
+    return false;
+  }
+};
+
+export { DATA_DIR, UPLOADS_DIR, EXPORTS_DIR, LEADS_DIR, TEMP_STORAGE_DIR, CLOUD_FILES_DIR };

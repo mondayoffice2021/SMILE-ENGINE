@@ -20,6 +20,8 @@ import { AutoDownloadFinishModal } from './AutoDownloadFinishModal';
 import { SecretCloudVaultModal } from './SecretCloudVaultModal';
 import { downloadCategoriesAsZip } from '../services/exportZip';
 import { uploadFileToCloudTemp, deleteCloudTempFile, fetchLinesFromCloudTemp } from '../services/cloudTempStorageClient';
+import { CloudFileHubBar } from './CloudFileHubBar';
+import { uploadToCloudFiles, fetchCloudFileLines, type CloudFileRecord } from '../services/cloudFilesClient';
 
 interface FolderExtractorProps {
   showToast: (msg: string) => void;
@@ -207,6 +209,7 @@ export const FolderExtractor: React.FC<FolderExtractorProps> = ({
         }
         
         // Add to processed log
+        uploadToCloudFiles(file, 'folder-extractor').catch(() => {});
         const fileLog: ProcessedFile = {
           id: Math.random().toString(36).substr(2, 9),
           name: file.name,
@@ -566,6 +569,61 @@ export const FolderExtractor: React.FC<FolderExtractorProps> = ({
     setShowVaultModal(true);
   };
 
+  const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [activeFileName, setActiveFileName] = useState<string | null>(null);
+
+  const handleSelectCloudFile = async (cloudFile: CloudFileRecord) => {
+    setActiveFileId(cloudFile.id);
+    setActiveFileName(cloudFile.originalName);
+    showToast(`Loading records from cloud file "${cloudFile.originalName}"...`);
+    try {
+      const res = await fetchCloudFileLines(cloudFile.id, 0, 10000);
+      const fileEmails: string[] = [];
+      for (const line of res.lines) {
+        const matches = line.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+        if (matches) fileEmails.push(...matches);
+      }
+      const unique = Array.from(new Set(fileEmails.map(e => e.toLowerCase())));
+      if (unique.length > 0) {
+        const newItems: ExtractedEmailItem[] = unique.map(email => ({
+          email,
+          domain: email.split('@')[1] || '',
+          sourceFiles: [cloudFile.originalName]
+        }));
+        setExtractedEmails(prev => {
+          const map = new Map<string, ExtractedEmailItem>();
+          prev.forEach(item => map.set(item.email, item));
+          newItems.forEach(item => {
+            if (map.has(item.email)) {
+              const existing = map.get(item.email)!;
+              if (!existing.sourceFiles.includes(cloudFile.originalName)) {
+                existing.sourceFiles.push(cloudFile.originalName);
+              }
+            } else {
+              map.set(item.email, item);
+            }
+          });
+          return Array.from(map.values());
+        });
+        setProcessedFiles(prev => [
+          {
+            id: `cloud-${cloudFile.id}`,
+            name: cloudFile.originalName,
+            size: cloudFile.fileSizeBytes,
+            emailsCount: unique.length,
+            status: 'success'
+          },
+          ...prev.filter(p => p.id !== `cloud-${cloudFile.id}`)
+        ]);
+        showToast(`Extracted ${unique.length.toLocaleString()} emails from Cloud File "${cloudFile.originalName}"!`);
+      } else {
+        showToast(`No emails detected in cloud file "${cloudFile.originalName}".`);
+      }
+    } catch (e: any) {
+      showToast(`Error reading cloud file: ${e.message}`);
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Cloud DB Sync & Server Execution Toolbar */}
@@ -577,6 +635,16 @@ export const FolderExtractor: React.FC<FolderExtractorProps> = ({
         itemsToUpload={itemsToUploadToCloudDb}
         onLoadLeads={handleLoadLeadsFromCloudDb}
         onNavigateToServerJobs={onNavigateToServerJobs}
+      />
+
+      {/* Central Cloud File Hub (Shared Across All Tabs) */}
+      <CloudFileHubBar
+        currentTabName="Folder Extractor"
+        sourceTabId="folder-extractor"
+        activeFileId={activeFileId}
+        activeFileName={activeFileName}
+        onSelectFile={handleSelectCloudFile}
+        showToast={showToast}
       />
 
       {/* Auto-Download All Categories ZIP & Secret Cloud Vault Bar */}
