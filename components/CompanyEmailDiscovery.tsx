@@ -35,12 +35,20 @@ import {
   RefreshCw,
   Mail,
   CloudUpload,
-  FileSpreadsheet
+  FileSpreadsheet,
+  Wand2,
+  ListFilter,
+  SlidersHorizontal
 } from 'lucide-react';
 import type { DiscoveredEmailRecord, DomainCrawlStatusRecord, CompanyDiscoverySessionRecord } from '../server/db';
 import {
   parseDomainsFromText,
   parseDomainsFromFile,
+  extractWebsitesFromMixedText,
+  extractWebsitesFromFile,
+  type WebsiteSeparatorOptions,
+  type ExtractedWebsiteItem,
+  type WebsiteExtractionResult,
   crawlDomainApi,
   saveDiscoverySessionApi,
   listDiscoverySessionsApi,
@@ -135,6 +143,124 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
   const [saveModalTab, setSaveModalTab] = useState<'emails' | 'all'>('emails');
   const [isUploadingEmailsToCloud, setIsUploadingEmailsToCloud] = useState<boolean>(false);
 
+  // Website Separator Studio State
+  const [isSeparatorModalOpen, setIsSeparatorModalOpen] = useState<boolean>(false);
+  const [separatorInputText, setSeparatorInputText] = useState<string>('');
+  const [separatorOptions, setSeparatorOptions] = useState<WebsiteSeparatorOptions>({
+    cleanToRootDomain: true,
+    excludeFreeEmailDomains: true,
+    excludeSocialMedia: true,
+    extractFromCorporateEmail: false,
+    removeDuplicates: true
+  });
+  const separatorFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Compute live extracted websites from separator input
+  const separatorResult = useMemo(() => {
+    return extractWebsitesFromMixedText(separatorInputText, separatorOptions);
+  }, [separatorInputText, separatorOptions]);
+
+  // Check if main input text contains mixed data/fields
+  const hasMixedText = useMemo(() => {
+    if (!inputText || inputText.trim().length === 0) return false;
+    return /[,;\t|]|@|https?:\/\/|www\./.test(inputText) || inputText.split('\n').some(l => l.trim().split(/\s+/).length > 2);
+  }, [inputText]);
+
+  // Quick separate websites from main input
+  const handleQuickSeparateWebsites = () => {
+    const res = extractWebsitesFromMixedText(inputText, {
+      cleanToRootDomain: true,
+      excludeFreeEmailDomains: true,
+      excludeSocialMedia: true,
+      extractFromCorporateEmail: false,
+      removeDuplicates: true
+    });
+    if (res.uniqueDomains.length === 0) {
+      showToast("No company websites found in the input text.");
+      return;
+    }
+    setInputText(res.uniqueDomains.join('\n'));
+    setDomainQueue(res.uniqueDomains);
+    setTotalRawInputCount(res.rawTotalFields);
+    showToast(`✓ Extracted ${res.uniqueDomains.length.toLocaleString()} clean websites! Filtered out ${res.filteredOutCount.toLocaleString()} non-website fields.`);
+  };
+
+  // Upload file specifically to Separator Studio
+  const handleSeparatorFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      showToast(`Separating websites from ${file.name}...`);
+      const res = await extractWebsitesFromFile(file, separatorOptions);
+      if (res.uniqueDomains.length === 0) {
+        showToast(`No company websites found in ${file.name}.`);
+        return;
+      }
+      setSeparatorInputText(res.uniqueDomains.join('\n'));
+      showToast(`✓ Extracted ${res.uniqueDomains.length.toLocaleString()} websites from ${file.name}! Filtered out ${res.filteredOutCount.toLocaleString()} other fields.`);
+    } catch (err: any) {
+      showToast(`Failed to parse file: ${err.message || 'Error'}`);
+    } finally {
+      if (separatorFileInputRef.current) separatorFileInputRef.current.value = '';
+    }
+  };
+
+  // Apply Separator results to Crawler Queue
+  const handleApplySeparatorToQueue = () => {
+    const websites = separatorOptions.cleanToRootDomain ? separatorResult.uniqueDomains : separatorResult.uniqueWebsites;
+    if (websites.length === 0) {
+      showToast("No websites extracted to load.");
+      return;
+    }
+    setInputText(websites.join('\n'));
+    setDomainQueue(separatorResult.uniqueDomains);
+    setTotalRawInputCount(separatorResult.rawTotalFields);
+    setIsSeparatorModalOpen(false);
+    showToast(`✓ Loaded ${websites.length.toLocaleString()} separated websites into crawler queue!`);
+  };
+
+  // Download extracted websites as clean TXT
+  const handleDownloadExtractedWebsitesTxt = () => {
+    const websites = separatorOptions.cleanToRootDomain ? separatorResult.uniqueDomains : separatorResult.uniqueWebsites;
+    if (websites.length === 0) {
+      showToast("No websites to export.");
+      return;
+    }
+    const blob = new Blob([websites.join('\n')], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `separated_websites_${websites.length}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast(`✓ Downloaded ${websites.length.toLocaleString()} extracted websites as TXT!`);
+  };
+
+  // Download extracted websites as CSV
+  const handleDownloadExtractedWebsitesCsv = () => {
+    if (separatorResult.items.length === 0) {
+      showToast("No websites to export.");
+      return;
+    }
+    const headers = ['#', 'Clean Domain', 'Full Website', 'Source Field', 'Original Raw Text'];
+    const rows = separatorResult.items.map((item, idx) => [
+      idx + 1,
+      `"${item.cleanDomain}"`,
+      `"${item.fullWebsite}"`,
+      `"${(item.fieldName || '').replace(/"/g, '""')}"`,
+      `"${(item.sourceText || '').replace(/"/g, '""')}"`
+    ]);
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `separated_websites_${separatorResult.items.length}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    showToast(`✓ Downloaded ${separatorResult.items.length.toLocaleString()} extracted websites as CSV!`);
+  };
+
   // Control Refs
   const abortControllerRef = useRef<AbortController | null>(null);
   const isPausedRef = useRef<boolean>(false);
@@ -175,22 +301,30 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
     if (!file) return;
 
     try {
-      showToast(`Reading and extracting company domains from ${file.name}...`);
-      const parsed = await parseDomainsFromFile(file);
+      showToast(`Separating and extracting company websites from ${file.name}...`);
+      const parsed = await extractWebsitesFromFile(file, { cleanToRootDomain: true, removeDuplicates: true });
 
       // Also auto-upload to central cloud file repository in background
       uploadToCloudFiles(file, 'company-discovery').catch(() => {});
 
       if (parsed.uniqueDomains.length === 0) {
-        showToast(`No valid company domains or URLs found in ${file.name}.`);
+        showToast(`No valid company websites found in ${file.name}.`);
         return;
       }
 
       setProjectName(`Discovery - ${file.name.replace(/\.[^/.]+$/, '')}`);
-      setTotalRawInputCount(parsed.totalRaw);
+      setTotalRawInputCount(parsed.rawTotalFields);
       setDomainQueue(parsed.uniqueDomains);
       setInputText(parsed.uniqueDomains.join('\n'));
-      showToast(`Loaded ${parsed.uniqueDomains.length.toLocaleString()} unique domains from ${file.name}! (Removed ${Math.max(0, parsed.totalRaw - parsed.uniqueDomains.length)} duplicates)`);
+      setSeparatorInputText(parsed.uniqueDomains.join('\n'));
+
+      const colInfo = parsed.detectedWebsiteColumn
+        ? ` (Isolated '${parsed.detectedWebsiteColumn}' column from ${parsed.detectedColumns?.length || 'multi-field'} fields)`
+        : parsed.filteredOutCount > 0
+        ? ` (Separated from ${parsed.filteredOutCount.toLocaleString()} non-website fields)`
+        : '';
+
+      showToast(`✓ Extracted ${parsed.uniqueDomains.length.toLocaleString()} clean websites from ${file.name}!${colInfo}`);
     } catch (err: any) {
       showToast(`Error loading file: ${err?.message || 'Failed to parse file'}`);
     } finally {
@@ -1101,8 +1235,22 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
                 )}
               </label>
 
-              {/* Upload Buttons */}
-              <div className="flex items-center gap-2">
+              {/* Upload & Separator Buttons */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSeparatorInputText(inputText || '');
+                    setIsSeparatorModalOpen(true);
+                  }}
+                  disabled={isCrawling}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-teal-700 to-emerald-700 hover:from-teal-600 hover:to-emerald-600 text-white border border-teal-500/50 flex items-center gap-1.5 transition-all shadow-sm shadow-teal-900/30"
+                  title="Extract only website URLs & company domains from mixed text, paragraphs, words, or multi-field files"
+                >
+                  <Wand2 className="w-3.5 h-3.5 text-teal-200" />
+                  Website Separator Studio
+                </button>
+
                 <input
                   type="file"
                   ref={fileInputRef}
@@ -1115,7 +1263,7 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
                   onClick={() => fileInputRef.current?.click()}
                   disabled={isCrawling}
                   className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-600 flex items-center gap-1.5 transition-all"
-                  title="Upload TXT, CSV or Excel file containing company domains"
+                  title="Upload TXT, CSV or Excel file containing company domains or multi-field records"
                 >
                   <Upload className="w-3.5 h-3.5 text-blue-400" />
                   Upload File (.txt, .csv, .xlsx)
@@ -1146,12 +1294,48 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
               value={inputText}
               onChange={handleTextChange}
               disabled={isCrawling}
-              placeholder="Paste company domains or website URLs (one per line, e.g. siemens.com, https://bmw.de, volkswagen.de)..."
+              placeholder="Paste company domains or website URLs, or paste messy mixed text, multi-field tables, CRM records, or words..."
               className="w-full p-3.5 bg-gray-900 border border-gray-700 rounded-xl text-sm text-gray-200 font-mono placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all"
             />
 
+            {/* Smart Mixed Text / Multiple Fields Detection Helper */}
+            {hasMixedText && (
+              <div className="p-3 bg-gradient-to-r from-teal-950/90 via-emerald-950/70 to-slate-900 border border-teal-500/50 rounded-xl flex items-center justify-between gap-3 text-xs animate-in fade-in flex-wrap">
+                <div className="flex items-center gap-2 text-teal-200">
+                  <Wand2 className="w-4 h-4 text-teal-400 shrink-0" />
+                  <div>
+                    <span className="font-bold text-white">Mixed text or multi-field data detected:</span>{' '}
+                    <span className="text-teal-300">
+                      We found {domainQueue.length.toLocaleString()} company websites mixed with other text, names, emails, or phone numbers.
+                    </span>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={handleQuickSeparateWebsites}
+                    className="px-3 py-1.5 text-xs font-bold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white flex items-center gap-1.5 shadow-md shadow-emerald-700/30 transition-all"
+                    title="Separate only websites and clean the input textarea"
+                  >
+                    <Filter className="w-3.5 h-3.5" />
+                    Extract Websites Only ({domainQueue.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSeparatorInputText(inputText);
+                      setIsSeparatorModalOpen(true);
+                    }}
+                    className="px-2.5 py-1.5 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-teal-300 border border-teal-700/60 transition-all"
+                  >
+                    Open Studio...
+                  </button>
+                </div>
+              </div>
+            )}
+
             <div className="flex items-center justify-between text-xs text-gray-400">
-              <span>Automatically strips protocols, subpaths, and duplicates.</span>
+              <span>Automatically separates websites from mixed words, removes email usernames, and strips protocols.</span>
               {domainQueue.length > 0 && (
                 <button
                   type="button"
@@ -2664,6 +2848,338 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
               >
                 Close
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* WEBSITE & DOMAIN SEPARATOR STUDIO MODAL */}
+      {isSeparatorModalOpen && (
+        <div className="fixed inset-0 bg-black/85 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-gray-900 border border-gray-700/90 rounded-2xl max-w-4xl w-full shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 flex flex-col max-h-[92vh]">
+            {/* Modal Header */}
+            <div className="p-4 border-b border-gray-800 flex items-center justify-between bg-gray-950/90">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-teal-500 to-emerald-600 flex items-center justify-center text-white shadow-lg shadow-teal-700/30">
+                  <Wand2 className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-white text-base flex items-center gap-2">
+                    Website & Domain Separator Studio
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-teal-500/20 text-teal-300 border border-teal-500/40">
+                      Multi-Field Extractor
+                    </span>
+                  </h3>
+                  <p className="text-gray-400 text-xs">
+                    Isolate only company websites from mixed text, paragraphs, words, CRM tables, or multi-field files.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsSeparatorModalOpen(false)}
+                className="p-1 rounded-lg text-gray-400 hover:text-white hover:bg-gray-800 transition-colors"
+              >
+                <XCircle className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="p-5 overflow-y-auto space-y-4 text-xs">
+              {/* Row 1: Input text area and upload trigger */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <label className="font-bold text-white flex items-center gap-1.5 text-xs">
+                    <FileText className="w-3.5 h-3.5 text-teal-400" />
+                    <span>Mixed Text, Paragraphs, Words, or Multi-Field Data</span>
+                  </label>
+
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="file"
+                      ref={separatorFileInputRef}
+                      onChange={handleSeparatorFileUpload}
+                      accept=".txt,.csv,.xlsx,.xls,.tsv"
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => separatorFileInputRef.current?.click()}
+                      className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-teal-300 border border-teal-700/60 flex items-center gap-1 transition-all"
+                    >
+                      <Upload className="w-3 h-3" />
+                      Upload Multi-Field File (.csv, .xlsx, .txt)
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const sample = `Acme Corp, John Doe, john.doe@gmail.com, https://www.acmecorp.com/about-us, +1-555-1234, Dallas TX\nGlobal Logistics GmbH;Hans Schmidt;h.schmidt@logistics.de;www.global-logistics.de/en;Berlin\nHere is a note: please visit https://alpha-tools.co.uk or check beta.org for export catalog.\nPresentation file: presentation.pdf and styles at style.css should NOT be extracted.\nReach out at sales@acmeworks.eu or info@tech-supplies.net.`;
+                        setSeparatorInputText(sample);
+                        showToast("Loaded sample multi-field data!");
+                      }}
+                      className="px-2.5 py-1 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 flex items-center gap-1 transition-all"
+                    >
+                      Load Sample
+                    </button>
+
+                    {separatorInputText && (
+                      <button
+                        type="button"
+                        onClick={() => setSeparatorInputText('')}
+                        className="text-xs text-red-400 hover:text-red-300 underline ml-1"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <textarea
+                  rows={4}
+                  value={separatorInputText}
+                  onChange={e => setSeparatorInputText(e.target.value)}
+                  placeholder="Paste any messy text, multi-column spreadsheet copy, CSV rows, or sentences containing websites mixed with names, addresses, emails, and phone numbers..."
+                  className="w-full p-3 bg-gray-950 border border-gray-800 rounded-xl text-xs text-gray-200 font-mono placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-teal-500"
+                />
+              </div>
+
+              {/* Row 2: Separation & Filter Settings */}
+              <div className="bg-gray-950/60 border border-gray-800 rounded-xl p-3.5 space-y-2.5">
+                <span className="text-[11px] font-bold text-gray-300 uppercase tracking-wider flex items-center gap-1.5">
+                  <SlidersHorizontal className="w-3.5 h-3.5 text-teal-400" />
+                  Separation & Clean-up Filters
+                </span>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-2.5">
+                  {/* Filter 1: Clean Root Domains */}
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-gray-900 border border-gray-800 cursor-pointer hover:bg-gray-850">
+                    <input
+                      type="checkbox"
+                      checked={separatorOptions.cleanToRootDomain ?? true}
+                      onChange={e => setSeparatorOptions({ ...separatorOptions, cleanToRootDomain: e.target.checked })}
+                      className="accent-teal-500 rounded"
+                    />
+                    <div className="leading-tight">
+                      <div className="font-semibold text-gray-200 text-[11px]">Clean Root Domain</div>
+                      <div className="text-[10px] text-gray-500">acme.com instead of URL</div>
+                    </div>
+                  </label>
+
+                  {/* Filter 2: Exclude Free Webmail */}
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-gray-900 border border-gray-800 cursor-pointer hover:bg-gray-850">
+                    <input
+                      type="checkbox"
+                      checked={separatorOptions.excludeFreeEmailDomains ?? true}
+                      onChange={e => setSeparatorOptions({ ...separatorOptions, excludeFreeEmailDomains: e.target.checked })}
+                      className="accent-teal-500 rounded"
+                    />
+                    <div className="leading-tight">
+                      <div className="font-semibold text-gray-200 text-[11px]">Exclude Free Emails</div>
+                      <div className="text-[10px] text-gray-500">Ignore gmail, yahoo, hotmail</div>
+                    </div>
+                  </label>
+
+                  {/* Filter 3: Exclude Social Media */}
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-gray-900 border border-gray-800 cursor-pointer hover:bg-gray-850">
+                    <input
+                      type="checkbox"
+                      checked={separatorOptions.excludeSocialMedia ?? true}
+                      onChange={e => setSeparatorOptions({ ...separatorOptions, excludeSocialMedia: e.target.checked })}
+                      className="accent-teal-500 rounded"
+                    />
+                    <div className="leading-tight">
+                      <div className="font-semibold text-gray-200 text-[11px]">Exclude Social Media</div>
+                      <div className="text-[10px] text-gray-500">Ignore linkedin, facebook</div>
+                    </div>
+                  </label>
+
+                  {/* Filter 4: Corporate Email Fallback */}
+                  <label className="flex items-center gap-2 p-2 rounded-lg bg-gray-900 border border-gray-800 cursor-pointer hover:bg-gray-850">
+                    <input
+                      type="checkbox"
+                      checked={separatorOptions.extractFromCorporateEmail ?? false}
+                      onChange={e => setSeparatorOptions({ ...separatorOptions, extractFromCorporateEmail: e.target.checked })}
+                      className="accent-teal-500 rounded"
+                    />
+                    <div className="leading-tight">
+                      <div className="font-semibold text-gray-200 text-[11px]">Email Domain Fallback</div>
+                      <div className="text-[10px] text-gray-500">Extract if no website in row</div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              {/* Row 3: Live Extraction Metrics */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                <div className="bg-emerald-950/40 border border-emerald-500/40 rounded-xl p-3">
+                  <span className="text-[10px] text-emerald-400 uppercase font-semibold flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3" />
+                    Websites Discovered
+                  </span>
+                  <div className="text-xl font-bold text-emerald-300 font-mono mt-0.5">
+                    {separatorResult.uniqueDomains.length.toLocaleString()}
+                  </div>
+                  <span className="text-[10px] text-emerald-400/80">Unique company sites</span>
+                </div>
+
+                <div className="bg-gray-800/60 border border-gray-700/60 rounded-xl p-3">
+                  <span className="text-[10px] text-gray-400 uppercase font-semibold">Analyzed Words / Fields</span>
+                  <div className="text-xl font-bold text-white font-mono mt-0.5">
+                    {separatorResult.rawTotalFields.toLocaleString()}
+                  </div>
+                  <span className="text-[10px] text-gray-400">Total tokens processed</span>
+                </div>
+
+                <div className="bg-gray-800/60 border border-gray-700/60 rounded-xl p-3">
+                  <span className="text-[10px] text-gray-400 uppercase font-semibold">Non-Websites Discarded</span>
+                  <div className="text-xl font-bold text-gray-300 font-mono mt-0.5">
+                    {separatorResult.filteredOutCount.toLocaleString()}
+                  </div>
+                  <span className="text-[10px] text-gray-400">Names, phones, words removed</span>
+                </div>
+
+                <div className="bg-gray-800/60 border border-gray-700/60 rounded-xl p-3">
+                  <span className="text-[10px] text-gray-400 uppercase font-semibold">Public Emails Skipped</span>
+                  <div className="text-xl font-bold text-amber-300 font-mono mt-0.5">
+                    {separatorResult.publicEmailDomainsSkipped.length.toLocaleString()}
+                  </div>
+                  <span className="text-[10px] text-amber-400/80">gmail/yahoo accounts ignored</span>
+                </div>
+              </div>
+
+              {/* Row 4: Discovered Websites Preview Table */}
+              <div className="border border-gray-800 rounded-xl overflow-hidden bg-gray-950/40">
+                <div className="p-2.5 bg-gray-900 border-b border-gray-800 flex items-center justify-between">
+                  <span className="font-bold text-white text-xs flex items-center gap-1.5">
+                    <Globe className="w-3.5 h-3.5 text-emerald-400" />
+                    Extracted Websites Preview ({separatorResult.uniqueDomains.length})
+                  </span>
+                  {separatorResult.detectedWebsiteColumn && (
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-950 text-blue-300 border border-blue-700/60">
+                      Isolated column: "{separatorResult.detectedWebsiteColumn}"
+                    </span>
+                  )}
+                </div>
+
+                <div className="max-h-56 overflow-y-auto">
+                  {separatorResult.items.length === 0 ? (
+                    <div className="py-8 text-center text-gray-500">
+                      Paste mixed text, paragraphs, or upload a multi-field file above to separate company websites.
+                    </div>
+                  ) : (
+                    <table className="w-full text-left text-xs border-collapse">
+                      <thead>
+                        <tr className="bg-gray-900/80 text-gray-400 border-b border-gray-800 font-semibold text-[11px]">
+                          <th className="py-2 px-3 w-10">#</th>
+                          <th className="py-2 px-3">Separated Website</th>
+                          <th className="py-2 px-3">Source Field / Column</th>
+                          <th className="py-2 px-3">Original Raw Input</th>
+                          <th className="py-2 px-3 text-right">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-850 text-gray-300">
+                        {separatorResult.items.map((item, idx) => (
+                          <tr key={idx} className="hover:bg-gray-850/60 transition-colors">
+                            <td className="py-2 px-3 font-mono text-gray-500 text-[11px]">{idx + 1}</td>
+                            <td className="py-2 px-3 font-mono font-bold text-emerald-300 select-all">
+                              {separatorOptions.cleanToRootDomain ? item.cleanDomain : item.fullWebsite}
+                            </td>
+                            <td className="py-2 px-3">
+                              {item.fieldName ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] bg-blue-950 text-blue-300 border border-blue-800">
+                                  {item.fieldName}
+                                </span>
+                              ) : item.isFromEmailDomain ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] bg-purple-950 text-purple-300 border border-purple-800">
+                                  Email Fallback
+                                </span>
+                              ) : (
+                                <span className="text-gray-500 text-[10px]">Inline Text</span>
+                              )}
+                            </td>
+                            <td className="py-2 px-3 font-mono text-[11px] text-gray-400 max-w-xs truncate" title={item.sourceText}>
+                              {item.sourceText}
+                            </td>
+                            <td className="py-2 px-3 text-right">
+                              <button
+                                type="button"
+                                onClick={() => handleCopy(separatorOptions.cleanToRootDomain ? item.cleanDomain : item.fullWebsite, `sep_${idx}`)}
+                                className="text-gray-400 hover:text-white p-1 rounded hover:bg-gray-800 transition-colors"
+                                title="Copy website"
+                              >
+                                {copiedKey === `sep_${idx}` ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 border-t border-gray-800 bg-gray-950/90 flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDownloadExtractedWebsitesTxt}
+                  disabled={separatorResult.uniqueDomains.length === 0}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 flex items-center gap-1.5 transition-all disabled:opacity-40"
+                  title="Download clean 1-per-line text file of extracted websites"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Save TXT
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleDownloadExtractedWebsitesCsv}
+                  disabled={separatorResult.uniqueDomains.length === 0}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 flex items-center gap-1.5 transition-all disabled:opacity-40"
+                  title="Download CSV spreadsheet of extracted websites with source attribution"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Save CSV
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const websites = separatorOptions.cleanToRootDomain ? separatorResult.uniqueDomains : separatorResult.uniqueWebsites;
+                    if (websites.length === 0) return;
+                    navigator.clipboard.writeText(websites.join('\n'));
+                    showToast(`✓ Copied ${websites.length.toLocaleString()} extracted websites to clipboard!`);
+                  }}
+                  disabled={separatorResult.uniqueDomains.length === 0}
+                  className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-200 border border-gray-700 flex items-center gap-1.5 transition-all disabled:opacity-40"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                  Copy All ({separatorResult.uniqueDomains.length})
+                </button>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsSeparatorModalOpen(false)}
+                  className="px-3.5 py-1.5 rounded-xl bg-gray-800 hover:bg-gray-750 text-gray-300 font-semibold text-xs transition-colors"
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleApplySeparatorToQueue}
+                  disabled={separatorResult.uniqueDomains.length === 0}
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-emerald-700/30 transition-all disabled:opacity-40"
+                >
+                  <CheckCircle2 className="w-4 h-4 text-emerald-100" />
+                  <span>Apply & Load into Discovery Queue ({separatorResult.uniqueDomains.length})</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>

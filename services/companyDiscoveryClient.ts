@@ -50,105 +50,456 @@ export const EMAIL_CATEGORIES_LIST = [
 export type EmailCategoryType = (typeof EMAIL_CATEGORIES_LIST)[number];
 
 /**
- * Normalizes input domain into a clean domain name
+ * Common free / public webmail providers that should NEVER be mistaken as company websites.
+ */
+export const PUBLIC_EMAIL_DOMAINS = new Set([
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'yahoo.co.uk', 'yahoo.fr', 'yahoo.de', 'yahoo.es', 'yahoo.it', 'yahoo.ca',
+  'hotmail.com', 'hotmail.co.uk', 'hotmail.fr', 'hotmail.de', 'hotmail.es', 'hotmail.it',
+  'outlook.com', 'outlook.fr', 'outlook.de', 'outlook.es', 'live.com', 'msn.com',
+  'icloud.com', 'me.com', 'mac.com', 'aol.com', 'aim.com', 'protonmail.com', 'proton.me',
+  'zoho.com', 'mail.com', 'gmx.com', 'gmx.de', 'gmx.net', 'web.de', 't-online.de', 'freenet.de',
+  'yandex.com', 'yandex.ru', 'mail.ru', 'rambler.ru', 'inbox.ru', 'list.ru', 'bk.ru',
+  'orange.fr', 'wanadoo.fr', 'free.fr', 'sfr.fr', 'laposte.net', 'neuf.fr',
+  'libero.it', 'virgilio.it', 'tiscali.it', 'alice.it', 'fastwebnet.it',
+  'terra.com.br', 'uol.com.br', 'bol.com.br', 'ig.com.br',
+  'qq.com', '163.com', '126.com', 'sina.com', 'sohu.com', 'aliyun.com',
+  'rediffmail.com', 'naver.com', 'daum.net', 'hanmail.net',
+  'comcast.net', 'sbcglobal.net', 'att.net', 'verizon.net', 'cox.net', 'charter.net', 'earthlink.net',
+  'bellsouth.net', 'shaw.ca', 'sympatico.ca', 'rogers.com', 'telus.net', 'btinternet.com', 'virginmedia.com',
+  'sky.com', 'talktalk.net'
+]);
+
+/**
+ * File extensions that should NOT be mistaken as web domain names when parsing words.
+ */
+export const IGNORE_FILE_EXTENSIONS = new Set([
+  'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'tiff', 'ico', 'psd',
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'tsv', 'txt', 'rtf', 'odt',
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'tgz',
+  'js', 'jsx', 'ts', 'tsx', 'css', 'scss', 'less', 'html', 'htm', 'xhtml', 'php', 'asp', 'aspx', 'jsp',
+  'json', 'xml', 'yaml', 'yml', 'sql', 'db', 'sqlite',
+  'mp3', 'mp4', 'wav', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'webm', 'ogg',
+  'woff', 'woff2', 'ttf', 'eot', 'otf',
+  'exe', 'dmg', 'apk', 'bin', 'iso', 'map', 'lock'
+]);
+
+/**
+ * Common social media networks that should be excluded when user wants company websites.
+ */
+export const SOCIAL_MEDIA_DOMAINS = new Set([
+  'facebook.com', 'fb.com', 'twitter.com', 'x.com', 'linkedin.com', 'instagram.com',
+  'youtube.com', 'tiktok.com', 'pinterest.com', 'reddit.com', 'github.com', 'gitlab.com',
+  'medium.com', 'whatsapp.com', 'telegram.org', 't.me', 'discord.com', 'discord.gg',
+  'threads.net', 'tumblr.com', 'flickr.com', 'snapchat.com', 'wikipedia.org'
+]);
+
+export interface WebsiteSeparatorOptions {
+  cleanToRootDomain?: boolean; // Return clean domain e.g. "acme.com" vs full URL "https://www.acme.com" (default: true)
+  excludeFreeEmailDomains?: boolean; // Exclude gmail.com, yahoo.com, etc. (default: true)
+  excludeSocialMedia?: boolean; // Exclude facebook, linkedin, twitter, etc. (default: true)
+  extractFromCorporateEmail?: boolean; // Extract company domain from corporate emails if no website in field (default: false)
+  removeDuplicates?: boolean; // Deduplicate output list (default: true)
+  selectedColumn?: string; // If parsing tabular data, optionally isolate this column
+}
+
+export interface ExtractedWebsiteItem {
+  cleanDomain: string;          // e.g. "acme.com"
+  fullWebsite: string;          // e.g. "https://www.acme.com"
+  sourceText: string;           // the original raw field, sentence, or word where it was discovered
+  fieldName?: string;           // if from a multi-field table (e.g. "Website", "Homepage", "Column 3")
+  rowIndex?: number;            // row number in file/text
+  isFromEmailDomain?: boolean;  // whether it was derived from a corporate email address
+}
+
+export interface WebsiteExtractionResult {
+  totalItemsFound: number;
+  uniqueWebsites: string[];             // array of distinct websites (clean domains or URLs depending on cleanToRootDomain)
+  uniqueDomains: string[];              // strictly deduplicated clean domains (e.g. "acme.com")
+  items: ExtractedWebsiteItem[];        // detailed record for each discovered item
+  detectedColumns?: string[];           // columns detected if CSV/Excel/Tabular data
+  detectedWebsiteColumn?: string;       // column name identified as containing websites
+  filteredOutCount: number;             // count of non-website fields/words skipped (names, phones, text, junk)
+  publicEmailDomainsSkipped: string[];  // public email domains safely ignored (e.g. gmail.com)
+  rawTotalFields: number;               // total fields/tokens/lines analyzed
+}
+
+/**
+ * Normalizes an input string, URL, or word into a clean company domain name
  */
 export function cleanDomainName(raw: string): string {
   if (!raw) return '';
   let str = raw.trim().toLowerCase();
+  // Strip mailto:, http://, https://, www.
+  str = str.replace(/^mailto:/i, '');
   str = str.replace(/^(?:https?:\/\/)?(?:www\.)?/, '');
   str = str.split('/')[0];
   str = str.split('?')[0];
   str = str.split('#')[0];
-  str = str.split(':')[0]; // Port
+  str = str.split(':')[0]; // Strip port
+  // Strip leading and trailing punctuation (quotes, brackets, periods)
+  str = str.replace(/^[^a-z0-9]+|[^a-z0-9]+$/gi, '');
   str = str.replace(/[^a-z0-9.-]/g, '');
   return str;
 }
 
 /**
- * Parses domain names from plain text, CSV, or lines
+ * Tests if a candidate string looks like a valid website / domain
  */
-export function parseDomainsFromText(text: string): { totalRaw: number; uniqueDomains: string[] } {
-  if (!text || !text.trim()) return { totalRaw: 0, uniqueDomains: [] };
+export function isValidWebsiteCandidate(candidate: string, options?: WebsiteSeparatorOptions): boolean {
+  if (!candidate || candidate.length < 4 || candidate.length > 255) return false;
+  const clean = cleanDomainName(candidate);
+  if (!clean || !clean.includes('.')) return false;
 
-  const lines = text
-    .split(/[\r\n,;]+/)
-    .map(l => l.trim())
-    .filter(l => l.length > 0 && !l.startsWith('#') && !l.startsWith('//'));
+  const parts = clean.split('.');
+  if (parts.length < 2) return false;
 
-  const validDomains: string[] = [];
-  const seen = new Set<string>();
+  const tld = parts[parts.length - 1];
+  // TLD must be alpha and 2 to 24 characters
+  if (!/^[a-z]{2,24}$/i.test(tld)) return false;
 
-  for (const line of lines) {
-    // If line has an email, extract its domain
-    if (line.includes('@')) {
-      const part = line.split('@')[1];
-      const d = cleanDomainName(part);
-      if (d && d.includes('.') && !seen.has(d)) {
-        seen.add(d);
-        validDomains.push(d);
-      }
-      continue;
-    }
+  // Must not be an ignored file extension
+  if (IGNORE_FILE_EXTENSIONS.has(tld)) return false;
 
-    // Try extracting domain from URL or word
-    const matches = line.match(/(?:https?:\/\/)?(?:www\.)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g);
-    if (matches) {
-      for (const m of matches) {
-        const d = cleanDomainName(m);
-        if (d && d.includes('.') && !seen.has(d)) {
-          seen.add(d);
-          validDomains.push(d);
-        }
-      }
-    } else {
-      const d = cleanDomainName(line);
-      if (d && d.includes('.') && d.length >= 4 && !seen.has(d)) {
-        seen.add(d);
-        validDomains.push(d);
-      }
+  // Must not be a numeric IP address
+  if (parts.every(p => /^\d+$/.test(p))) return false;
+
+  // Check public email providers
+  const excludeFreeEmails = options?.excludeFreeEmailDomains ?? true;
+  if (excludeFreeEmails && PUBLIC_EMAIL_DOMAINS.has(clean)) {
+    return false;
+  }
+
+  // Check social media
+  const excludeSocial = options?.excludeSocialMedia ?? true;
+  if (excludeSocial && SOCIAL_MEDIA_DOMAINS.has(clean)) {
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Comprehensive Website & Domain Separator:
+ * Isolates and extracts only websites/domains from mixed text, unstructured paragraphs,
+ * words, or multi-field delimited rows (CSV, TSV, pipes, tabs).
+ */
+export function extractWebsitesFromMixedText(
+  text: string,
+  options?: WebsiteSeparatorOptions
+): WebsiteExtractionResult {
+  if (!text || !text.trim()) {
+    return {
+      totalItemsFound: 0,
+      uniqueWebsites: [],
+      uniqueDomains: [],
+      items: [],
+      filteredOutCount: 0,
+      publicEmailDomainsSkipped: [],
+      rawTotalFields: 0
+    };
+  }
+
+  const cleanToRoot = options?.cleanToRootDomain ?? true;
+  const excludeFreeEmails = options?.excludeFreeEmailDomains ?? true;
+  const excludeSocial = options?.excludeSocialMedia ?? true;
+  const extractEmailDomain = options?.extractFromCorporateEmail ?? false;
+
+  const items: ExtractedWebsiteItem[] = [];
+  const publicEmailDomainsSkipped = new Set<string>();
+  let filteredOutCount = 0;
+  let rawTotalFields = 0;
+
+  // Split into raw lines
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+
+  // Check if text is tabular (CSV, TSV, or delimiter-separated)
+  let detectedDelimiter: string | null = null;
+  const sampleLines = lines.slice(0, 5);
+  for (const delim of ['\t', ',', ';', '|']) {
+    const counts = sampleLines.map(l => l.split(delim).length);
+    if (counts.length > 0 && counts[0] > 1 && counts.every(c => c === counts[0])) {
+      detectedDelimiter = delim;
+      break;
     }
   }
 
+  let detectedColumns: string[] | undefined;
+  let detectedWebsiteColIndex = -1;
+  let detectedWebsiteColumn: string | undefined;
+
+  // If tabular delimiter detected, inspect header row
+  if (detectedDelimiter && lines.length > 1) {
+    const headerFields = lines[0].split(detectedDelimiter).map(h => h.replace(/^["']|["']$/g, '').trim());
+    const websiteKeywords = /^(website|web|url|site|domain|homepage|company_url|web_site|link|page)$/i;
+
+    const matchedIndex = headerFields.findIndex(h => websiteKeywords.test(h));
+    if (matchedIndex >= 0) {
+      detectedColumns = headerFields;
+      detectedWebsiteColIndex = matchedIndex;
+      detectedWebsiteColumn = headerFields[matchedIndex];
+    }
+  }
+
+  // Regex to discover URLs and domains within any text or word
+  // 1. Full URLs: https?://...
+  const urlRegex = /https?:\/\/[^\s"'<>,;|\(\)\[\]\{\}]+/gi;
+  // 2. www sites: www.domain.tld/...
+  const wwwRegex = /\bwww\.[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+(?:\/[^\s"'<>,;|\(\)\[\]\{\}]*)?/gi;
+  // 3. Domain pattern: words with valid dot and TLD
+  const domainPatternRegex = /\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,24}(?:\/[^\s"'<>,;|\(\)\[\]\{\}]*)?/gi;
+
+  lines.forEach((line, lineIndex) => {
+    // Skip comment lines
+    if (line.startsWith('#') || line.startsWith('//')) {
+      return;
+    }
+
+    // Tabular row processing if delimiter found
+    if (detectedDelimiter) {
+      const cells = line.split(detectedDelimiter).map(c => c.replace(/^["']|["']$/g, '').trim());
+      rawTotalFields += cells.length;
+
+      // If this is row 0 and it matches our header, skip processing as data
+      if (lineIndex === 0 && detectedWebsiteColIndex >= 0) {
+        return;
+      }
+
+      let websiteFoundInRow = false;
+
+      // Check specific website column first if detected
+      if (detectedWebsiteColIndex >= 0 && cells[detectedWebsiteColIndex]) {
+        const val = cells[detectedWebsiteColIndex];
+        const clean = cleanDomainName(val);
+        if (isValidWebsiteCandidate(val, options)) {
+          items.push({
+            cleanDomain: clean,
+            fullWebsite: val.startsWith('http') ? val : `https://${clean}`,
+            sourceText: val,
+            fieldName: detectedWebsiteColumn,
+            rowIndex: lineIndex + 1
+          });
+          websiteFoundInRow = true;
+        }
+      }
+
+      // Scan all other cells in the row for any other embedded websites
+      cells.forEach((cell, cellIdx) => {
+        if (cellIdx === detectedWebsiteColIndex && websiteFoundInRow) return;
+        if (!cell) return;
+
+        // If cell is an email
+        if (cell.includes('@') && !cell.startsWith('http')) {
+          const emailDomain = cleanDomainName(cell.split('@')[1] || '');
+          if (PUBLIC_EMAIL_DOMAINS.has(emailDomain)) {
+            publicEmailDomainsSkipped.add(emailDomain);
+            filteredOutCount++;
+            return;
+          }
+          if (extractEmailDomain && !websiteFoundInRow && isValidWebsiteCandidate(emailDomain, options)) {
+            items.push({
+              cleanDomain: emailDomain,
+              fullWebsite: `https://${emailDomain}`,
+              sourceText: cell,
+              fieldName: detectedColumns ? detectedColumns[cellIdx] : `Column ${cellIdx + 1}`,
+              rowIndex: lineIndex + 1,
+              isFromEmailDomain: true
+            });
+            websiteFoundInRow = true;
+            return;
+          }
+          filteredOutCount++;
+          return;
+        }
+
+        // Check if cell is a URL or domain
+        const clean = cleanDomainName(cell);
+        if (isValidWebsiteCandidate(cell, options)) {
+          items.push({
+            cleanDomain: clean,
+            fullWebsite: cell.startsWith('http') ? cell : `https://${clean}`,
+            sourceText: cell,
+            fieldName: detectedColumns ? detectedColumns[cellIdx] : `Column ${cellIdx + 1}`,
+            rowIndex: lineIndex + 1
+          });
+          websiteFoundInRow = true;
+        } else {
+          filteredOutCount++;
+        }
+      });
+
+      return;
+    }
+
+    // Free-form text / mixed word processing
+    const words = line.split(/\s+/).filter(Boolean);
+    rawTotalFields += words.length;
+
+    const seenCleanInLine = new Set<string>();
+
+    // 1. Scan for full URLs: https?://... and www....
+    const urlMatches = line.match(urlRegex) || [];
+    const wwwMatches = line.match(wwwRegex) || [];
+    const allMatches = Array.from(new Set([...urlMatches, ...wwwMatches]));
+
+    for (const match of allMatches) {
+      const clean = cleanDomainName(match);
+      if (clean && isValidWebsiteCandidate(clean, options) && !seenCleanInLine.has(clean)) {
+        seenCleanInLine.add(clean);
+        items.push({
+          cleanDomain: clean,
+          fullWebsite: match.startsWith('http') ? match : `https://${match}`,
+          sourceText: match,
+          rowIndex: lineIndex + 1
+        });
+      }
+    }
+
+    // 2. Scan all tokens / words for naked domains
+    const domainMatches = line.match(domainPatternRegex) || [];
+    for (const rawMatch of domainMatches) {
+      // Strip trailing punctuation
+      const cleanedRaw = rawMatch.replace(/[.,;:!?)\]}"']+$/, '');
+      const clean = cleanDomainName(cleanedRaw);
+      if (!clean || seenCleanInLine.has(clean)) continue;
+
+      // Check if match is immediately followed by @ (meaning it's an email username like john.doe@...)
+      const isEmailUser = new RegExp(cleanedRaw.replace(/\./g, '\\.') + '@', 'i').test(line);
+      if (isEmailUser) {
+        filteredOutCount++;
+        continue;
+      }
+
+      // Check if preceded by @ in original line (meaning it was an email domain)
+      const isEmailDomain = new RegExp('@' + cleanedRaw.replace(/\./g, '\\.'), 'i').test(line);
+      if (isEmailDomain) {
+        if (PUBLIC_EMAIL_DOMAINS.has(clean)) {
+          publicEmailDomainsSkipped.add(clean);
+          filteredOutCount++;
+          continue;
+        }
+        if (extractEmailDomain && isValidWebsiteCandidate(clean, options)) {
+          seenCleanInLine.add(clean);
+          items.push({
+            cleanDomain: clean,
+            fullWebsite: `https://${clean}`,
+            sourceText: cleanedRaw,
+            rowIndex: lineIndex + 1,
+            isFromEmailDomain: true
+          });
+        } else {
+          filteredOutCount++;
+        }
+        continue;
+      }
+
+      if (isValidWebsiteCandidate(clean, options)) {
+        seenCleanInLine.add(clean);
+        items.push({
+          cleanDomain: clean,
+          fullWebsite: `https://${clean}`,
+          sourceText: cleanedRaw,
+          rowIndex: lineIndex + 1
+        });
+      } else {
+        filteredOutCount++;
+      }
+    }
+
+    if (seenCleanInLine.size === 0) {
+      filteredOutCount += words.length;
+    }
+  });
+
+  // Deduplicate
+  const seenDomains = new Set<string>();
+  const uniqueItems: ExtractedWebsiteItem[] = [];
+
+  for (const item of items) {
+    const key = cleanToRoot ? item.cleanDomain.toLowerCase() : item.fullWebsite.toLowerCase();
+    if (!seenDomains.has(key)) {
+      seenDomains.add(key);
+      uniqueItems.push(item);
+    }
+  }
+
+  const finalItems = options?.removeDuplicates === false ? items : uniqueItems;
+  const uniqueDomains = Array.from(new Set(finalItems.map(i => i.cleanDomain))).filter(Boolean);
+  const uniqueWebsites = cleanToRoot
+    ? uniqueDomains
+    : Array.from(new Set(finalItems.map(i => i.fullWebsite))).filter(Boolean);
+
   return {
-    totalRaw: lines.length,
-    uniqueDomains: validDomains
+    totalItemsFound: items.length,
+    uniqueWebsites,
+    uniqueDomains,
+    items: finalItems,
+    detectedColumns,
+    detectedWebsiteColumn,
+    filteredOutCount,
+    publicEmailDomainsSkipped: Array.from(publicEmailDomainsSkipped),
+    rawTotalFields
   };
 }
 
 /**
- * Parses domains from TXT, CSV, XLSX, XLS file
+ * Extracts websites and domains from uploaded files (TXT, CSV, XLSX, XLS)
  */
-export async function parseDomainsFromFile(file: File): Promise<{ totalRaw: number; uniqueDomains: string[]; filename: string }> {
+export async function extractWebsitesFromFile(
+  file: File,
+  options?: WebsiteSeparatorOptions
+): Promise<WebsiteExtractionResult & { filename: string }> {
   const filename = file.name;
   const ext = filename.split('.').pop()?.toLowerCase();
 
   if (ext === 'xlsx' || ext === 'xls') {
     const buffer = await file.arrayBuffer();
     const wb = XLSX.read(buffer, { type: 'array' });
-    const collectedStrings: string[] = [];
+    const collectedRows: string[] = [];
 
     wb.SheetNames.forEach(sheetName => {
       const ws = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json<any>(ws, { header: 1 });
       rows.forEach((row: any) => {
         if (Array.isArray(row)) {
-          row.forEach(cell => {
-            if (cell !== undefined && cell !== null) {
-              collectedStrings.push(String(cell));
-            }
-          });
+          const cells = row.map(c => (c !== undefined && c !== null ? String(c).trim() : ''));
+          if (cells.some(c => c.length > 0)) {
+            collectedRows.push(cells.join('\t'));
+          }
         }
       });
     });
 
-    const parsed = parseDomainsFromText(collectedStrings.join('\n'));
+    const parsed = extractWebsitesFromMixedText(collectedRows.join('\n'), options);
     return { ...parsed, filename };
   } else {
-    // TXT or CSV
+    // TXT, CSV, TSV
     const text = await file.text();
-    const parsed = parseDomainsFromText(text);
+    const parsed = extractWebsitesFromMixedText(text, options);
     return { ...parsed, filename };
   }
+}
+
+/**
+ * Default domain parsing entry point (uses smart website separator)
+ */
+export function parseDomainsFromText(text: string): { totalRaw: number; uniqueDomains: string[] } {
+  const res = extractWebsitesFromMixedText(text, { cleanToRootDomain: true, removeDuplicates: true });
+  return {
+    totalRaw: res.rawTotalFields || res.uniqueDomains.length,
+    uniqueDomains: res.uniqueDomains
+  };
+}
+
+/**
+ * Default file domain parsing entry point (uses smart website separator)
+ */
+export async function parseDomainsFromFile(file: File): Promise<{ totalRaw: number; uniqueDomains: string[]; filename: string }> {
+  const res = await extractWebsitesFromFile(file, { cleanToRootDomain: true, removeDuplicates: true });
+  return {
+    totalRaw: res.rawTotalFields || res.uniqueDomains.length,
+    uniqueDomains: res.uniqueDomains,
+    filename: res.filename
+  };
 }
 
 /**
