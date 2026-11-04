@@ -888,3 +888,403 @@ export async function exportDiscoveryCategoriesZip(
   a.click();
   URL.revokeObjectURL(url);
 }
+
+// ============================================================================
+// COMPANY NAME & PRODUCTS SEARCH ENGINE WEBSITE FINDER (Feature)
+// ============================================================================
+
+export interface CompanySearchQuery {
+  id?: string;
+  companyName: string;
+  productsOrServices?: string;
+  countryOrLocation?: string;
+  industry?: string;
+}
+
+export interface CompanySearchResult {
+  id: string;
+  companyName: string;
+  productsOrServices?: string;
+  countryOrLocation?: string;
+  industry?: string;
+  officialWebsite?: string;
+  cleanDomain?: string;
+  confidenceScore: number;
+  verificationStatus: 'verified_official' | 'probable_match' | 'no_website_found';
+  verificationReason: string;
+  pageTitle?: string;
+  searchSnippet?: string;
+  discoveredEmails: DiscoveredEmailRecord[];
+  phone?: string;
+  searchedAt: string;
+}
+
+export interface FindOfficialWebsiteOptions {
+  discoverEmails?: boolean;
+  timeoutMs?: number;
+  strictDirectoryFilter?: boolean;
+  maxEmailPages?: number;
+}
+
+/**
+ * Searches search engines for an authentic official website of a company name + product
+ */
+export async function findOfficialWebsiteApi(
+  query: CompanySearchQuery,
+  options?: FindOfficialWebsiteOptions,
+  signal?: AbortSignal
+): Promise<CompanySearchResult> {
+  const res = await safeFetchJson<any>('/api/company-discovery/find-website', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      companyName: query.companyName,
+      productsOrServices: query.productsOrServices,
+      countryOrLocation: query.countryOrLocation,
+      industry: query.industry,
+      discoverEmails: options?.discoverEmails !== false
+    })
+  });
+
+  if (!res.ok || !res.data?.result) {
+    throw new Error(res.error || 'Failed to search company website');
+  }
+
+  return res.data.result;
+}
+
+/**
+ * Batch search official websites for multiple company names
+ */
+export async function findOfficialWebsitesBatchApi(
+  companies: CompanySearchQuery[],
+  options?: { discoverEmails?: boolean; concurrency?: number },
+  signal?: AbortSignal
+): Promise<CompanySearchResult[]> {
+  const res = await safeFetchJson<any>('/api/company-discovery/find-websites-batch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    signal,
+    body: JSON.stringify({
+      companies,
+      discoverEmails: options?.discoverEmails !== false,
+      concurrency: options?.concurrency ?? 2
+    })
+  });
+
+  if (!res.ok || !res.data?.results) {
+    throw new Error(res.error || 'Failed to batch search company websites');
+  }
+
+  return res.data.results;
+}
+
+/**
+ * Parses company names (and optional products/services, country/location) from raw text or CSV/TSV
+ */
+export function parseCompanyNamesFromText(text: string): {
+  total: number;
+  queries: CompanySearchQuery[];
+  detectedColumns?: string[];
+} {
+  if (!text || !text.trim()) {
+    return { total: 0, queries: [] };
+  }
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+  if (lines.length === 0) return { total: 0, queries: [] };
+
+  // Detect delimiter
+  let detectedDelimiter: string | null = null;
+  const sampleLines = lines.slice(0, 5);
+  for (const delim of ['\t', ',', ';', '|']) {
+    const counts = sampleLines.map(l => l.split(delim).length);
+    if (counts.length > 0 && counts[0] > 1 && counts.every(c => c === counts[0])) {
+      detectedDelimiter = delim;
+      break;
+    }
+  }
+
+  let companyColIdx = 0;
+  let productColIdx = -1;
+  let countryColIdx = -1;
+  let industryColIdx = -1;
+  let detectedColumns: string[] | undefined;
+  let dataStartIndex = 0;
+
+  if (detectedDelimiter && lines.length > 1) {
+    const headerFields = lines[0].split(detectedDelimiter).map(h => h.replace(/^["']|["']$/g, '').trim().toLowerCase());
+    const companyKeywords = /^(company|company_name|companyname|business|business_name|organization|organisation|enterprise|brand|firm|name|client|account|vendor)$/i;
+    const productKeywords = /^(product|products|service|services|offering|offerings|goods|item|items|keywords|specialty|specialties|description)$/i;
+    const locationKeywords = /^(country|location|nation|state|city|region|hq|headquarters|address)$/i;
+    const industryKeywords = /^(industry|sector|category|vertical|niche)$/i;
+
+    let foundHeader = false;
+    headerFields.forEach((h, idx) => {
+      if (companyKeywords.test(h)) { companyColIdx = idx; foundHeader = true; }
+      else if (productKeywords.test(h)) { productColIdx = idx; foundHeader = true; }
+      else if (locationKeywords.test(h)) { countryColIdx = idx; foundHeader = true; }
+      else if (industryKeywords.test(h)) { industryColIdx = idx; foundHeader = true; }
+    });
+
+    if (foundHeader) {
+      detectedColumns = lines[0].split(detectedDelimiter).map(h => h.replace(/^["']|["']$/g, '').trim());
+      dataStartIndex = 1;
+    }
+  }
+
+  const queries: CompanySearchQuery[] = [];
+  const seenCompanies = new Set<string>();
+
+  for (let i = dataStartIndex; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('#') || line.startsWith('//')) continue;
+
+    let companyName = '';
+    let productsOrServices: string | undefined;
+    let countryOrLocation: string | undefined;
+    let industry: string | undefined;
+
+    if (detectedDelimiter) {
+      const cells = line.split(detectedDelimiter).map(c => c.replace(/^["']|["']$/g, '').trim());
+      companyName = cells[companyColIdx] || '';
+      if (productColIdx >= 0 && cells[productColIdx]) productsOrServices = cells[productColIdx];
+      if (countryColIdx >= 0 && cells[countryColIdx]) countryOrLocation = cells[countryColIdx];
+      if (industryColIdx >= 0 && cells[industryColIdx]) industry = cells[industryColIdx];
+    } else {
+      // Check for simple hyphen or pipe separator like "Siemens - Industrial automation - Germany"
+      if (line.includes(' - ')) {
+        const parts = line.split(' - ').map(p => p.trim());
+        companyName = parts[0] || '';
+        if (parts[1]) productsOrServices = parts[1];
+        if (parts[2]) countryOrLocation = parts[2];
+      } else if (line.includes(' | ')) {
+        const parts = line.split(' | ').map(p => p.trim());
+        companyName = parts[0] || '';
+        if (parts[1]) productsOrServices = parts[1];
+        if (parts[2]) countryOrLocation = parts[2];
+      } else {
+        companyName = line;
+      }
+    }
+
+    companyName = companyName.trim();
+    if (!companyName) continue;
+
+    const normKey = companyName.toLowerCase();
+    if (seenCompanies.has(normKey)) continue;
+    seenCompanies.add(normKey);
+
+    queries.push({
+      id: `comp_${queries.length + 1}_${Date.now().toString(36)}`,
+      companyName,
+      productsOrServices,
+      countryOrLocation,
+      industry
+    });
+  }
+
+  return {
+    total: queries.length,
+    queries,
+    detectedColumns
+  };
+}
+
+/**
+ * Parses company names and optional products/services from uploaded file (TXT, CSV, XLSX, XLS)
+ */
+export async function parseCompanyNamesFromFile(
+  file: File
+): Promise<{ total: number; queries: CompanySearchQuery[]; filename: string; detectedColumns?: string[] }> {
+  const filename = file.name;
+  const ext = filename.split('.').pop()?.toLowerCase();
+
+  if (ext === 'xlsx' || ext === 'xls') {
+    const buffer = await file.arrayBuffer();
+    const wb = XLSX.read(buffer, { type: 'array' });
+    const collectedLines: string[] = [];
+
+    wb.SheetNames.forEach(sheetName => {
+      const ws = wb.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json<any>(ws, { header: 1 });
+      rows.forEach((row: any) => {
+        if (Array.isArray(row)) {
+          const cells = row.map(c => (c !== undefined && c !== null ? String(c).trim() : ''));
+          if (cells.some(c => c.length > 0)) {
+            collectedLines.push(cells.join('\t'));
+          }
+        }
+      });
+    });
+
+    const parsed = parseCompanyNamesFromText(collectedLines.join('\n'));
+    return { ...parsed, filename };
+  } else {
+    const text = await file.text();
+    const parsed = parseCompanyNamesFromText(text);
+    return { ...parsed, filename };
+  }
+}
+
+/**
+ * Export Company Search Results to Microsoft Excel (XLSX)
+ */
+export function exportCompanySearchResultsToExcel(
+  results: CompanySearchResult[],
+  filename: string = 'Company_Official_Websites_Report'
+): void {
+  const wb = XLSX.utils.book_new();
+
+  // Sheet 1: Master Researched Companies
+  const companyRows = results.map((r, i) => ({
+    '#': i + 1,
+    'Company Name': r.companyName,
+    'Products / Services': r.productsOrServices || '',
+    'Country / Location': r.countryOrLocation || '',
+    'Official Website': r.officialWebsite || '',
+    'Clean Domain': r.cleanDomain || '',
+    'Confidence Score': `${r.confidenceScore}%`,
+    'Status': r.verificationStatus === 'verified_official' ? 'Verified Official' : r.verificationStatus === 'probable_match' ? 'Probable Match' : 'No Website Found',
+    'Verification Reason': r.verificationReason || '',
+    'Discovered Corporate Emails': r.discoveredEmails.length,
+    'Email Addresses List': r.discoveredEmails.map(e => e.email).join('; '),
+    'Page Title': r.pageTitle || '',
+    'Phone': r.phone || '',
+    'Researched At': r.searchedAt
+  }));
+  const wsCompanies = XLSX.utils.json_to_sheet(companyRows);
+  XLSX.utils.book_append_sheet(wb, wsCompanies, 'Companies Researched');
+
+  // Sheet 2: Verified Official Websites Only
+  const verifiedOnly = results.filter(r => r.cleanDomain && (r.verificationStatus === 'verified_official' || r.verificationStatus === 'probable_match'));
+  const verifiedRows = verifiedOnly.map((r, i) => ({
+    '#': i + 1,
+    'Company Name': r.companyName,
+    'Clean Domain': r.cleanDomain || '',
+    'Official Website': r.officialWebsite || '',
+    'Confidence Score': `${r.confidenceScore}%`,
+    'Discovered Emails Count': r.discoveredEmails.length
+  }));
+  const wsVerified = XLSX.utils.json_to_sheet(verifiedRows);
+  XLSX.utils.book_append_sheet(wb, wsVerified, 'Verified Websites Only');
+
+  // Sheet 3: Discovered Emails Detail
+  const allEmails: any[] = [];
+  results.forEach(r => {
+    r.discoveredEmails.forEach(e => {
+      allEmails.push({
+        'Company Name': r.companyName,
+        'Official Website': r.officialWebsite || '',
+        'Company Domain': e.companyDomain || r.cleanDomain || '',
+        'Discovered Email': e.email,
+        'Email Category': e.category,
+        'Exact Source Page URL': e.sourcePageUrl,
+        'Discovery Status': e.discoveryStatus || 'Publicly Listed',
+        'Discovered At': e.discoveredAt
+      });
+    });
+  });
+  if (allEmails.length > 0) {
+    const wsEmails = XLSX.utils.json_to_sheet(allEmails);
+    XLSX.utils.book_append_sheet(wb, wsEmails, 'Discovered Emails');
+  }
+
+  const cleanName = filename.replace(/[^a-zA-Z0-9_-]/g, '_');
+  XLSX.writeFile(wb, `${cleanName}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+/**
+ * Export Company Search Results to CSV
+ */
+export function exportCompanySearchResultsToCsv(
+  results: CompanySearchResult[],
+  filename: string = 'company_official_websites.csv'
+): void {
+  const headers = [
+    'Company Name',
+    'Products/Services',
+    'Country/Location',
+    'Official Website',
+    'Clean Domain',
+    'Confidence Score',
+    'Verification Status',
+    'Verification Reason',
+    'Discovered Emails Count',
+    'Emails',
+    'Page Title',
+    'Phone'
+  ];
+
+  const rows = results.map(r => [
+    `"${r.companyName.replace(/"/g, '""')}"`,
+    `"${(r.productsOrServices || '').replace(/"/g, '""')}"`,
+    `"${(r.countryOrLocation || '').replace(/"/g, '""')}"`,
+    `"${(r.officialWebsite || '').replace(/"/g, '""')}"`,
+    `"${(r.cleanDomain || '').replace(/"/g, '""')}"`,
+    `"${r.confidenceScore}%"`,
+    `"${r.verificationStatus}"`,
+    `"${(r.verificationReason || '').replace(/"/g, '""')}"`,
+    `"${r.discoveredEmails.length}"`,
+    `"${r.discoveredEmails.map(e => e.email).join('; ').replace(/"/g, '""')}"`,
+    `"${(r.pageTitle || '').replace(/"/g, '""')}"`,
+    `"${(r.phone || '').replace(/"/g, '""')}"`
+  ]);
+
+  const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+  const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename.endsWith('.csv') ? filename : `${filename}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Export ONLY clean verified domains/websites to plain TXT
+ */
+export function exportVerifiedWebsitesTxt(
+  results: CompanySearchResult[],
+  filename: string = 'verified_company_websites.txt',
+  asCleanDomains = true
+): void {
+  const websites = results
+    .filter(r => r.cleanDomain && (r.verificationStatus === 'verified_official' || r.verificationStatus === 'probable_match'))
+    .map(r => asCleanDomains ? (r.cleanDomain || '').toLowerCase() : (r.officialWebsite || ''))
+    .filter(Boolean);
+
+  const unique = Array.from(new Set(websites));
+  const blob = new Blob([unique.join('\n')], { type: 'text/plain;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename.endsWith('.txt') ? filename : `${filename}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+/**
+ * Export ONLY unique discovered emails from company research to TXT
+ */
+export function exportCompanyResearchEmailsTxt(
+  results: CompanySearchResult[],
+  filename: string = 'researched_company_emails.txt'
+): void {
+  const emails = new Set<string>();
+  results.forEach(r => {
+    r.discoveredEmails.forEach(e => {
+      if (e.email) emails.add(e.email.toLowerCase().trim());
+    });
+  });
+
+  const blob = new Blob([Array.from(emails).join('\n')], { type: 'text/plain;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename.endsWith('.txt') ? filename : `${filename}.txt`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+

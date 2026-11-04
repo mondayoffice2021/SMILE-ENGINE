@@ -3,7 +3,10 @@ import {
   crawlCompanyDomain,
   searchGoogleForCompanyEmails,
   normalizeDomain,
-  type CrawlDomainOptions
+  findOfficialWebsiteForCompany,
+  findOfficialWebsitesBatch,
+  type CrawlDomainOptions,
+  type CompanySearchQuery
 } from './companyDiscoveryService';
 import { dbCompanyDiscoveries, type CompanyDiscoverySessionRecord } from './db';
 import type { AuthRequest } from './auth';
@@ -121,7 +124,80 @@ export function registerCompanyDiscoveryRoutes(app: express.Express): void {
     }
   });
 
-  // 3. Save Project / Session to Database
+  // 4. Find Official Website for Company Name & Product (Single)
+  app.post('/api/company-discovery/find-website', async (req, res) => {
+    try {
+      const { companyName, productsOrServices, countryOrLocation, industry, discoverEmails } = req.body || {};
+      if (!companyName || typeof companyName !== 'string' || !companyName.trim()) {
+        return res.status(400).json({ error: 'Company name is required' });
+      }
+
+      const result = await findOfficialWebsiteForCompany(
+        {
+          companyName: companyName.trim(),
+          productsOrServices: typeof productsOrServices === 'string' ? productsOrServices.trim() : undefined,
+          countryOrLocation: typeof countryOrLocation === 'string' ? countryOrLocation.trim() : undefined,
+          industry: typeof industry === 'string' ? industry.trim() : undefined
+        },
+        {
+          discoverEmails: discoverEmails !== false
+        }
+      );
+
+      res.json({
+        success: true,
+        result
+      });
+    } catch (err: any) {
+      console.error('[Company Discovery] Find website error:', err?.message || err);
+      res.status(500).json({ error: err?.message || 'Failed to find company website' });
+    }
+  });
+
+  // 5. Batch Find Official Websites for Multiple Companies
+  app.post('/api/company-discovery/find-websites-batch', async (req, res) => {
+    try {
+      const { companies, discoverEmails, concurrency } = req.body || {};
+      if (!Array.isArray(companies) || companies.length === 0) {
+        return res.status(400).json({ error: 'Array of company queries is required' });
+      }
+
+      const cleanQueries: CompanySearchQuery[] = companies
+        .filter(c => c && (typeof c === 'string' || typeof c.companyName === 'string'))
+        .map((c, i) => {
+          if (typeof c === 'string') {
+            return { id: `comp_${i}`, companyName: c.trim() };
+          }
+          return {
+            id: c.id || `comp_${i}`,
+            companyName: (c.companyName || '').trim(),
+            productsOrServices: c.productsOrServices ? String(c.productsOrServices).trim() : undefined,
+            countryOrLocation: c.countryOrLocation ? String(c.countryOrLocation).trim() : undefined,
+            industry: c.industry ? String(c.industry).trim() : undefined
+          };
+        })
+        .filter(c => c.companyName.length > 0)
+        .slice(0, 300);
+
+      const results = await findOfficialWebsitesBatch(
+        cleanQueries,
+        {
+          discoverEmails: discoverEmails !== false,
+          concurrency: Math.min(5, Math.max(1, parseInt(concurrency) || 2))
+        }
+      );
+
+      res.json({
+        success: true,
+        results
+      });
+    } catch (err: any) {
+      console.error('[Company Discovery] Batch find websites error:', err?.message || err);
+      res.status(500).json({ error: err?.message || 'Failed to batch search company websites' });
+    }
+  });
+
+  // 6. Save Project / Session to Database
   app.post('/api/company-discovery/save', (req: AuthRequest, res) => {
     try {
       const payload = req.body?.session ? req.body.session : req.body;

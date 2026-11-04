@@ -1048,3 +1048,447 @@ export async function crawlCompanyDomain(
     crawledPages
   };
 }
+
+/**
+ * Directory, aggregator, and social media domains that must NEVER be accepted as official company websites.
+ */
+export const NON_OFFICIAL_DIRECTORY_DOMAINS = new Set([
+  'facebook.com', 'm.facebook.com', 'fb.com', 'instagram.com', 'twitter.com', 'x.com',
+  'linkedin.com', 'tiktok.com', 'youtube.com', 'pinterest.com', 'reddit.com',
+  'yelp.com', 'yelp.co.uk', 'yellowpages.com', 'yellowpages.ca', 'pagesjaunes.fr', 'gelbeseiten.de',
+  'crunchbase.com', 'bloomberg.com', 'reuters.com', 'forbes.com', 'fortune.com',
+  'dnb.com', 'zoominfo.com', 'apollo.io', 'pitchbook.com', 'owler.com', 'cbinsights.com',
+  'wikipedia.org', 'wikidata.org', 'wikimedia.org', 'britannica.com',
+  'glassdoor.com', 'indeed.com', 'ziprecruiter.com', 'monster.com',
+  'tripadvisor.com', 'trustpilot.com', 'bbb.org', 'sitejabber.com',
+  'kompass.com', 'europages.com', 'europages.co.uk', 'thomasnet.com', 'industrynet.com',
+  'alibaba.com', 'aliexpress.com', 'amazon.com', 'amazon.co.uk', 'amazon.de', 'ebay.com', 'walmart.com', 'etsy.com',
+  'google.com', 'bing.com', 'duckduckgo.com', 'yahoo.com', 'yandex.com', 'baidu.com',
+  'medium.com', 'quora.com', 'github.com', 'gitlab.com', 'substack.com',
+  'cloudflare.com', 'sentry.io', 'w3.org', 'schema.org', 'wordpress.org', 'wordpress.com'
+]);
+
+export interface CompanySearchQuery {
+  id?: string;
+  companyName: string;
+  productsOrServices?: string;
+  countryOrLocation?: string;
+  industry?: string;
+}
+
+export interface CompanySearchResult {
+  id: string;
+  companyName: string;
+  productsOrServices?: string;
+  countryOrLocation?: string;
+  industry?: string;
+  officialWebsite?: string;
+  cleanDomain?: string;
+  confidenceScore: number;
+  verificationStatus: 'verified_official' | 'probable_match' | 'no_website_found';
+  verificationReason: string;
+  pageTitle?: string;
+  searchSnippet?: string;
+  discoveredEmails: DiscoveredEmailRecord[];
+  phone?: string;
+  searchedAt: string;
+}
+
+export interface FindOfficialWebsiteOptions {
+  discoverEmails?: boolean;
+  timeoutMs?: number;
+  strictDirectoryFilter?: boolean;
+  maxEmailPages?: number;
+}
+
+/**
+ * Strips corporate legal suffixes from company name to get brand/keyword root
+ */
+export function cleanCompanyLegalSuffixes(name: string): string {
+  if (!name) return '';
+  return name
+    .replace(/\b(?:inc|incorporated|llc|ltd|limited|gmbh|corp|corporation|co|srl|spa|bv|nv|ag|sa|sl|sas|oy|ab|plc|group|holding|holdings|technologies|solutions|international)\b\.?/gi, '')
+    .replace(/[^\w\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Tests if a hostname belongs to a non-official directory, aggregator, social, or government site
+ */
+export function isDirectoryOrAggregatorDomain(hostname: string): boolean {
+  if (!hostname) return true;
+  const host = hostname.toLowerCase().replace(/^www\./, '');
+
+  if (NON_OFFICIAL_DIRECTORY_DOMAINS.has(host)) return true;
+  for (const agg of NON_OFFICIAL_DIRECTORY_DOMAINS) {
+    if (host === agg || host.endsWith(`.${agg}`)) return true;
+  }
+
+  // Reject .gov, .mil, .edu
+  if (host.endsWith('.gov') || host.includes('.gov.') || host.endsWith('.mil') || host.endsWith('.edu') || host.includes('.edu.')) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Calculates domain similarity and confidence score for an official company website candidate
+ */
+export function calculateWebsiteConfidence(
+  candidateDomain: string,
+  candidateUrl: string,
+  hitTitle: string,
+  hitSnippet: string,
+  companyName: string,
+  productsOrServices?: string,
+  countryOrLocation?: string
+): { score: number; reason: string } {
+  const host = candidateDomain.toLowerCase().replace(/^www\./, '');
+  if (isDirectoryOrAggregatorDomain(host)) {
+    return { score: 0, reason: 'Excluded aggregator or directory domain' };
+  }
+
+  let score = 20; // Base score for non-directory candidate
+  const reasons: string[] = [];
+
+  const rawCleanName = cleanCompanyLegalSuffixes(companyName).toLowerCase();
+  const nameTokens = rawCleanName.split(/\s+/).filter(t => t.length > 1);
+  const joinedName = nameTokens.join('');
+  const domainNoTld = host.split('.')[0].replace(/[^a-z0-9]/g, '');
+
+  // 1. Lexical domain match
+  if (domainNoTld === joinedName) {
+    score += 45;
+    reasons.push('Exact brand name in domain');
+  } else if (nameTokens.length > 0 && domainNoTld.includes(joinedName)) {
+    score += 38;
+    reasons.push('Full company name matches domain');
+  } else if (nameTokens.length > 0 && joinedName.includes(domainNoTld) && domainNoTld.length >= 4) {
+    score += 35;
+    reasons.push('Domain matches company brand name');
+  } else if (nameTokens.some(t => t.length >= 3 && domainNoTld.includes(t))) {
+    score += 25;
+    reasons.push('Domain contains company brand token');
+  }
+
+  // 2. Title match
+  const lowerTitle = (hitTitle || '').toLowerCase();
+  if (lowerTitle.includes(rawCleanName) || (nameTokens.length > 0 && lowerTitle.includes(nameTokens[0]))) {
+    score += 15;
+    reasons.push('Page title matches company name');
+  }
+
+  // 3. Official website keyword indicators
+  const combinedText = `${lowerTitle} ${(hitSnippet || '').toLowerCase()}`;
+  if (
+    combinedText.includes('official website') ||
+    combinedText.includes('official site') ||
+    combinedText.includes('homepage') ||
+    combinedText.includes('welcome to') ||
+    combinedText.includes('home page')
+  ) {
+    score += 12;
+    reasons.push('Search snippet specifies official website');
+  }
+
+  // 4. Products / Services match
+  if (productsOrServices && productsOrServices.trim()) {
+    const prodTokens = productsOrServices.toLowerCase().split(/[,\s]+/).filter(t => t.length > 2);
+    const matchedProds = prodTokens.filter(p => combinedText.includes(p));
+    if (matchedProds.length > 0) {
+      score += 10;
+      reasons.push(`Snippet matches products (${matchedProds.slice(0, 2).join(', ')})`);
+    }
+  }
+
+  // 5. Country / Location match
+  if (countryOrLocation && countryOrLocation.trim()) {
+    const cLow = countryOrLocation.toLowerCase().trim();
+    if (combinedText.includes(cLow) || host.endsWith(`.${cLow}`)) {
+      score += 8;
+      reasons.push('Country / Location match');
+    }
+  }
+
+  // 6. Homepage / Root URL preference
+  try {
+    const urlObj = new URL(candidateUrl);
+    if (urlObj.pathname === '/' || urlObj.pathname === '' || urlObj.pathname.length <= 1) {
+      score += 10;
+      reasons.push('Root homepage URL');
+    }
+  } catch {}
+
+  const finalScore = Math.min(100, Math.max(0, score));
+  return {
+    score: finalScore,
+    reason: reasons.length > 0 ? reasons.join(' • ') : 'Standard search match'
+  };
+}
+
+/**
+ * Searches search engines for an official company website and optionally extracts emails
+ */
+export async function findOfficialWebsiteForCompany(
+  query: CompanySearchQuery,
+  options: FindOfficialWebsiteOptions = {}
+): Promise<CompanySearchResult> {
+  const companyName = (query.companyName || '').trim();
+  const id = query.id || `comp_${crypto.randomUUID().slice(0, 10)}`;
+  const searchedAt = new Date().toISOString();
+
+  if (!companyName) {
+    return {
+      id,
+      companyName: '',
+      confidenceScore: 0,
+      verificationStatus: 'no_website_found',
+      verificationReason: 'Company name was empty',
+      discoveredEmails: [],
+      searchedAt
+    };
+  }
+
+  const cleanName = cleanCompanyLegalSuffixes(companyName);
+  const products = (query.productsOrServices || '').trim();
+  const country = (query.countryOrLocation || '').trim();
+  const discoverEmails = options.discoverEmails !== false;
+  const timeoutMs = options.timeoutMs || 8000;
+
+  // Build high-precision search queries
+  const searchQueries: string[] = [];
+  if (products && country) {
+    searchQueries.push(`"${cleanName}" ${products} ${country} official website`);
+  } else if (products) {
+    searchQueries.push(`"${cleanName}" ${products} official website`);
+  } else if (country) {
+    searchQueries.push(`"${cleanName}" ${country} official website`);
+  }
+  searchQueries.push(`"${cleanName}" official website`);
+  searchQueries.push(`"${cleanName}" company homepage`);
+
+  let candidateHits: SearchHit[] = [];
+
+  for (const q of searchQueries) {
+    try {
+      let hits = await searchMultiEnginePaginated(q, 1, 'auto');
+      if (!hits || hits.length === 0) {
+        hits = await searchGoogleEngine(q, 1, 8);
+      }
+      if (!hits || hits.length === 0) {
+        hits = await searchDuckDuckGoEngine(q, 1, 8);
+      }
+      if (hits && hits.length > 0) {
+        candidateHits.push(...hits);
+        if (candidateHits.length >= 8) break;
+      }
+    } catch (err: any) {
+      console.warn(`[Company Website Finder] Search query failed: "${q}":`, err.message);
+    }
+  }
+
+  // Score candidate hits
+  interface ScoredCandidate {
+    url: string;
+    domain: string;
+    score: number;
+    reason: string;
+    hit: SearchHit;
+  }
+
+  const scoredCandidates: ScoredCandidate[] = [];
+  const seenHosts = new Set<string>();
+
+  for (const hit of candidateHits) {
+    if (!hit.url || !hit.url.startsWith('http')) continue;
+    try {
+      const urlObj = new URL(hit.url);
+      const host = urlObj.hostname.toLowerCase().replace(/^www\./, '');
+      if (!host || seenHosts.has(host)) continue;
+      seenHosts.add(host);
+
+      if (isDirectoryOrAggregatorDomain(host)) continue;
+
+      const evalResult = calculateWebsiteConfidence(
+        host,
+        hit.url,
+        hit.title || '',
+        hit.snippet || '',
+        companyName,
+        products,
+        country
+      );
+
+      if (evalResult.score >= 35) {
+        scoredCandidates.push({
+          url: `https://${host}`,
+          domain: host,
+          score: evalResult.score,
+          reason: evalResult.reason,
+          hit
+        });
+      }
+    } catch {}
+  }
+
+  // Sort descending by confidence score
+  scoredCandidates.sort((a, b) => b.score - a.score);
+
+  // If no candidates passed score threshold
+  if (scoredCandidates.length === 0) {
+    return {
+      id,
+      companyName,
+      productsOrServices: products || undefined,
+      countryOrLocation: country || undefined,
+      industry: query.industry || undefined,
+      confidenceScore: 0,
+      verificationStatus: 'no_website_found',
+      verificationReason: 'No authentic official company website matched in search engines (filtered out directories)',
+      discoveredEmails: [],
+      searchedAt
+    };
+  }
+
+  // Top candidate verification probe (verify domain is responsive)
+  const topCandidate = scoredCandidates[0];
+  let verifiedWebsite = topCandidate.url;
+  let finalScore = topCandidate.score;
+  let pageTitle = topCandidate.hit.title || '';
+  let searchSnippet = topCandidate.hit.snippet || '';
+  let phone: string | undefined;
+  let discoveredEmails: DiscoveredEmailRecord[] = [];
+
+  // Verify responsive homepage via quick fetch
+  try {
+    const probeRes = await fetch(topCandidate.url, {
+      headers: {
+        'User-Agent': getRandomUA(),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(4500)
+    });
+
+    if (probeRes.ok) {
+      finalScore = Math.min(100, finalScore + 10);
+      const html = await probeRes.text();
+      const extractedT = extractTitle(html);
+      if (extractedT) pageTitle = extractedT;
+      phone = extractPhoneFromHtml(html);
+    }
+  } catch {
+    // If https failed, test http
+    try {
+      const httpUrl = `http://${topCandidate.domain}`;
+      const probeRes = await fetch(httpUrl, {
+        headers: { 'User-Agent': getRandomUA() },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(4000)
+      });
+      if (probeRes.ok) {
+        verifiedWebsite = httpUrl;
+        finalScore = Math.min(100, finalScore + 5);
+      }
+    } catch {}
+  }
+
+  // Discover emails if requested
+  if (discoverEmails && topCandidate.domain) {
+    try {
+      const crawlRes = await crawlCompanyDomain(topCandidate.domain, {
+        maxPages: options.maxEmailPages || 4,
+        timeoutMs: timeoutMs,
+        politeDelayMs: 150,
+        searchGoogleIfNoEmail: true,
+        strictCorporateFilter: true
+      });
+
+      if (crawlRes.records && crawlRes.records.length > 0) {
+        discoveredEmails = crawlRes.records;
+      }
+      if (crawlRes.companyName && !pageTitle) {
+        pageTitle = crawlRes.companyName;
+      }
+    } catch (crawlErr: any) {
+      console.warn(`[Company Website Finder] Email crawl error for ${topCandidate.domain}:`, crawlErr.message);
+    }
+  }
+
+  const verificationStatus: CompanySearchResult['verificationStatus'] =
+    finalScore >= 60 ? 'verified_official' : finalScore >= 40 ? 'probable_match' : 'no_website_found';
+
+  return {
+    id,
+    companyName,
+    productsOrServices: products || undefined,
+    countryOrLocation: country || undefined,
+    industry: query.industry || undefined,
+    officialWebsite: verifiedWebsite,
+    cleanDomain: topCandidate.domain,
+    confidenceScore: finalScore,
+    verificationStatus,
+    verificationReason: topCandidate.reason,
+    pageTitle,
+    searchSnippet,
+    discoveredEmails,
+    phone,
+    searchedAt
+  };
+}
+
+/**
+ * Batch processes multiple companies to find official websites and discover emails
+ */
+export async function findOfficialWebsitesBatch(
+  queries: CompanySearchQuery[],
+  options: FindOfficialWebsiteOptions & { concurrency?: number } = {},
+  onProgress?: (completed: number, total: number, currentResult: CompanySearchResult) => void
+): Promise<CompanySearchResult[]> {
+  const concurrency = Math.min(6, Math.max(1, options.concurrency || 2));
+  const results: CompanySearchResult[] = [];
+  let nextIndex = 0;
+  let completed = 0;
+
+  const worker = async () => {
+    while (nextIndex < queries.length) {
+      const idx = nextIndex++;
+      const q = queries[idx];
+      try {
+        const res = await findOfficialWebsiteForCompany(q, options);
+        results.push(res);
+        completed++;
+        if (onProgress) {
+          onProgress(completed, queries.length, res);
+        }
+      } catch (err: any) {
+        const fallbackRes: CompanySearchResult = {
+          id: q.id || `comp_${idx}`,
+          companyName: q.companyName,
+          productsOrServices: q.productsOrServices,
+          countryOrLocation: q.countryOrLocation,
+          confidenceScore: 0,
+          verificationStatus: 'no_website_found',
+          verificationReason: `Search error: ${err.message || 'Failed to search'}`,
+          discoveredEmails: [],
+          searchedAt: new Date().toISOString()
+        };
+        results.push(fallbackRes);
+        completed++;
+        if (onProgress) {
+          onProgress(completed, queries.length, fallbackRes);
+        }
+      }
+      // Polite delay between search requests
+      await new Promise(r => setTimeout(r, 200));
+    }
+  };
+
+  const workers = Array.from({ length: Math.min(concurrency, queries.length) }, () => worker());
+  await Promise.all(workers);
+
+  return results;
+}
+

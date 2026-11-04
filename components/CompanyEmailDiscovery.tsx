@@ -38,7 +38,14 @@ import {
   FileSpreadsheet,
   Wand2,
   ListFilter,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Briefcase,
+  Package,
+  MapPin,
+  ArrowRight,
+  SearchCheck,
+  FileCheck,
+  CheckCheck
 } from 'lucide-react';
 import type { DiscoveredEmailRecord, DomainCrawlStatusRecord, CompanyDiscoverySessionRecord } from '../server/db';
 import {
@@ -64,7 +71,17 @@ import {
   DEFAULT_DISCOVERY_CONFIG,
   EMAIL_CATEGORIES_LIST,
   type DiscoveryCrawlerConfig,
-  type DomainDiscoveryResult
+  type DomainDiscoveryResult,
+  type CompanySearchQuery,
+  type CompanySearchResult,
+  findOfficialWebsiteApi,
+  findOfficialWebsitesBatchApi,
+  parseCompanyNamesFromText,
+  parseCompanyNamesFromFile,
+  exportCompanySearchResultsToExcel,
+  exportCompanySearchResultsToCsv,
+  exportVerifiedWebsitesTxt,
+  exportCompanyResearchEmailsTxt
 } from '../services/companyDiscoveryClient';
 import { CloudFileHubBar } from './CloudFileHubBar';
 import { SessionRecoveryBanner } from './SessionRecoveryBanner';
@@ -266,6 +283,330 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
   const isPausedRef = useRef<boolean>(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
+
+  // ==========================================================================
+  // COMPANY NAME & PRODUCT SEARCH ENGINE WEBSITE FINDER STATE & HANDLERS
+  // ==========================================================================
+  const [activeWorkspaceMode, setActiveWorkspaceMode] = useState<'crawler' | 'company_finder'>('crawler');
+  const [companyInputText, setCompanyInputText] = useState<string>('');
+  const [companyQueries, setCompanyQueries] = useState<CompanySearchQuery[]>([]);
+  const [companyResults, setCompanyResults] = useState<CompanySearchResult[]>([]);
+  const [isSearchingCompanies, setIsSearchingCompanies] = useState<boolean>(false);
+  const [isCompanySearchPaused, setIsCompanySearchPaused] = useState<boolean>(false);
+  const [companyProgressIndex, setCompanyProgressIndex] = useState<number>(0);
+  const [companyActiveWorkers, setCompanyActiveWorkers] = useState<string[]>([]);
+  const [companyDiscoverEmails, setCompanyDiscoverEmails] = useState<boolean>(true);
+  const [companyConcurrency, setCompanyConcurrency] = useState<number>(2);
+  const [companyFinderStatusFilter, setCompanyFinderStatusFilter] = useState<'all' | 'verified' | 'probable' | 'with_emails' | 'no_website'>('all');
+  const [companySearchTerm, setCompanySearchTerm] = useState<string>('');
+  const [companyDetectedColumns, setCompanyDetectedColumns] = useState<string[] | undefined>();
+  const [expandedCompanyId, setExpandedCompanyId] = useState<string | null>(null);
+  const [selectedCompanyIds, setSelectedCompanyIds] = useState<Set<string>>(new Set());
+  const companyFileInputRef = useRef<HTMLInputElement>(null);
+  const companyAbortControllerRef = useRef<AbortController | null>(null);
+  const isCompanySearchPausedRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    isCompanySearchPausedRef.current = isCompanySearchPaused;
+  }, [isCompanySearchPaused]);
+
+  // Company Name Text Input Handler
+  const handleCompanyTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const val = e.target.value;
+    setCompanyInputText(val);
+    const parsed = parseCompanyNamesFromText(val);
+    setCompanyQueries(parsed.queries);
+    setCompanyDetectedColumns(parsed.detectedColumns);
+  };
+
+  // Company Name File Upload Handler (TXT, CSV, XLSX, XLS)
+  const handleCompanyFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    try {
+      showToast(`Parsing company names & products from ${file.name}...`);
+      const parsed = await parseCompanyNamesFromFile(file);
+
+      // Auto-upload to central cloud storage
+      uploadToCloudFiles(file, 'company-discovery').catch(() => {});
+
+      if (parsed.queries.length === 0) {
+        showToast(`No company names found in ${file.name}.`);
+        return;
+      }
+
+      setCompanyQueries(parsed.queries);
+      setCompanyDetectedColumns(parsed.detectedColumns);
+      setCompanyInputText(
+        parsed.queries.map(q => {
+          let line = q.companyName;
+          if (q.productsOrServices) line += ` - ${q.productsOrServices}`;
+          if (q.countryOrLocation) line += ` - ${q.countryOrLocation}`;
+          return line;
+        }).join('\n')
+      );
+
+      const colMsg = parsed.detectedColumns && parsed.detectedColumns.length > 0
+        ? ` (Mapped: ${parsed.detectedColumns.slice(0, 3).join(', ')})`
+        : '';
+      showToast(`✓ Loaded ${parsed.queries.length.toLocaleString()} companies from ${file.name}!${colMsg}`);
+    } catch (err: any) {
+      showToast(`Error parsing company file: ${err?.message || 'Failed to read file'}`);
+    } finally {
+      if (companyFileInputRef.current) companyFileInputRef.current.value = '';
+    }
+  };
+
+  // Start Company Search Engine Research
+  const handleStartCompanySearch = async () => {
+    if (companyQueries.length === 0) {
+      showToast("Please enter or upload company names to research.");
+      return;
+    }
+
+    setIsSearchingCompanies(true);
+    setIsCompanySearchPaused(false);
+    isCompanySearchPausedRef.current = false;
+    companyAbortControllerRef.current = new AbortController();
+
+    const startIdx = companyProgressIndex >= companyQueries.length ? 0 : companyProgressIndex;
+    if (startIdx === 0) {
+      setCompanyProgressIndex(0);
+    }
+
+    showToast(`Searching Google & multi-engine for official websites across ${companyQueries.length - startIdx} companies...`);
+
+    const queue = companyQueries.slice(startIdx);
+    const workersCount = Math.min(companyConcurrency, queue.length);
+
+    const runWorker = async (workerId: number) => {
+      while (queue.length > 0 && !companyAbortControllerRef.current?.signal.aborted) {
+        if (isCompanySearchPausedRef.current) {
+          await new Promise(r => setTimeout(r, 300));
+          continue;
+        }
+
+        const query = queue.shift();
+        if (!query) break;
+
+        setCompanyActiveWorkers(prev => [...prev.filter(w => !w.startsWith(`W${workerId}:`)), `W${workerId}: ${query.companyName}`]);
+
+        try {
+          const res = await findOfficialWebsiteApi(
+            query,
+            { discoverEmails: companyDiscoverEmails },
+            companyAbortControllerRef.current?.signal
+          );
+
+          setCompanyResults(prev => {
+            const idx = prev.findIndex(p => p.id === res.id || p.companyName.toLowerCase() === res.companyName.toLowerCase());
+            if (idx >= 0) {
+              const copy = [...prev];
+              copy[idx] = res;
+              return copy;
+            }
+            return [...prev, res];
+          });
+        } catch (err: any) {
+          if (err.name === 'AbortError') break;
+          const fallbackRes: CompanySearchResult = {
+            id: query.id || `comp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            companyName: query.companyName,
+            productsOrServices: query.productsOrServices,
+            countryOrLocation: query.countryOrLocation,
+            industry: query.industry,
+            confidenceScore: 0,
+            verificationStatus: 'no_website_found',
+            verificationReason: err?.message || 'Search timeout',
+            discoveredEmails: [],
+            searchedAt: new Date().toISOString()
+          };
+          setCompanyResults(prev => {
+            const idx = prev.findIndex(p => p.companyName.toLowerCase() === query.companyName.toLowerCase());
+            if (idx >= 0) {
+              const copy = [...prev];
+              copy[idx] = fallbackRes;
+              return copy;
+            }
+            return [...prev, fallbackRes];
+          });
+        }
+
+        setCompanyProgressIndex(prev => prev + 1);
+        setCompanyActiveWorkers(prev => prev.filter(w => !w.startsWith(`W${workerId}:`)));
+
+        // Polite delay between queries
+        await new Promise(r => setTimeout(r, 350));
+      }
+    };
+
+    try {
+      const workers = Array.from({ length: workersCount }, (_, i) => runWorker(i + 1));
+      await Promise.all(workers);
+      if (!companyAbortControllerRef.current?.signal.aborted) {
+        showToast("✓ Search engine research completed for all company names!");
+      }
+    } finally {
+      setIsSearchingCompanies(false);
+      setCompanyActiveWorkers([]);
+    }
+  };
+
+  const handleToggleCompanyPause = () => {
+    setIsCompanySearchPaused(prev => !prev);
+  };
+
+  const handleStopCompanySearch = () => {
+    if (companyAbortControllerRef.current) {
+      companyAbortControllerRef.current.abort();
+    }
+    setIsSearchingCompanies(false);
+    setIsCompanySearchPaused(false);
+    setCompanyActiveWorkers([]);
+    showToast("Search engine research stopped.");
+  };
+
+  const handleClearCompanySearch = () => {
+    if (isSearchingCompanies) handleStopCompanySearch();
+    setCompanyInputText('');
+    setCompanyQueries([]);
+    setCompanyResults([]);
+    setCompanyProgressIndex(0);
+    setCompanyDetectedColumns(undefined);
+    showToast("Cleared company research workbench.");
+  };
+
+  // Transfer Verified Websites to Direct Domain Crawler
+  const handleTransferVerifiedWebsitesToCrawler = () => {
+    const verifiedDomains = companyResults
+      .filter(r => r.cleanDomain && (r.verificationStatus === 'verified_official' || r.verificationStatus === 'probable_match'))
+      .map(r => r.cleanDomain!.toLowerCase());
+
+    const unique = Array.from(new Set(verifiedDomains));
+    if (unique.length === 0) {
+      showToast("No verified official company websites found to transfer.");
+      return;
+    }
+
+    setDomainQueue(prev => Array.from(new Set([...prev, ...unique])));
+    setInputText(prev => {
+      const existing = prev ? prev.split('\n').map(s => s.trim()).filter(Boolean) : [];
+      return Array.from(new Set([...existing, ...unique])).join('\n');
+    });
+    setActiveWorkspaceMode('crawler');
+    showToast(`✓ Transferred ${unique.length.toLocaleString()} verified company websites into Deep Subpage Crawler!`);
+  };
+
+  // Save / Export Handlers for Company Finder
+  const handleExportCompanyExcel = () => {
+    if (companyResults.length === 0) {
+      showToast("No researched company results to export.");
+      return;
+    }
+    exportCompanySearchResultsToExcel(companyResults, `${projectName}_Companies_Websites_Report`);
+    showToast(`✓ Exported ${companyResults.length.toLocaleString()} researched companies to Excel!`);
+  };
+
+  const handleExportCompanyCsv = () => {
+    if (companyResults.length === 0) {
+      showToast("No researched company results to export.");
+      return;
+    }
+    exportCompanySearchResultsToCsv(companyResults, `${projectName}_companies.csv`);
+    showToast(`✓ Exported ${companyResults.length.toLocaleString()} companies to CSV!`);
+  };
+
+  const handleExportCompanyWebsitesTxt = (cleanOnly = true) => {
+    const verified = companyResults.filter(r => r.cleanDomain && (r.verificationStatus === 'verified_official' || r.verificationStatus === 'probable_match'));
+    if (verified.length === 0) {
+      showToast("No verified websites to export.");
+      return;
+    }
+    exportVerifiedWebsitesTxt(companyResults, `${projectName}_verified_websites.txt`, cleanOnly);
+    showToast(`✓ Exported ${verified.length.toLocaleString()} verified websites to TXT!`);
+  };
+
+  const handleExportCompanyEmailsTxt = () => {
+    let count = 0;
+    companyResults.forEach(r => { count += r.discoveredEmails.length; });
+    if (count === 0) {
+      showToast("No discovered corporate emails to export.");
+      return;
+    }
+    exportCompanyResearchEmailsTxt(companyResults, `${projectName}_company_emails.txt`);
+    showToast(`✓ Exported clean company emails to TXT!`);
+  };
+
+  const handleSaveCompanyEmailsToCloud = async () => {
+    const emails = new Set<string>();
+    companyResults.forEach(r => {
+      r.discoveredEmails.forEach(e => {
+        if (e.email) emails.add(e.email.toLowerCase().trim());
+      });
+    });
+
+    if (emails.size === 0) {
+      showToast("No discovered emails to save to Cloud.");
+      return;
+    }
+
+    try {
+      const blob = new Blob([Array.from(emails).join('\n')], { type: 'text/plain;charset=utf-8' });
+      const filename = `company_emails_${emails.size}_${Date.now()}.txt`;
+      const file = new File([blob], filename, { type: 'text/plain' });
+      const uploaded = await uploadToCloudFiles(file, 'company-discovery');
+      setActiveCloudFileId(uploaded.id);
+      setActiveCloudFileName(uploaded.originalName);
+      showToast(`✓ Saved ${emails.size.toLocaleString()} clean corporate emails to Cloud Vault!`);
+    } catch (err: any) {
+      showToast(`Cloud save error: ${err.message || 'Failed to save to cloud'}`);
+    }
+  };
+
+  // Computed Company Finder Metrics
+  const totalCompaniesCount = companyQueries.length || companyResults.length;
+  const verifiedWebsitesCount = useMemo(() => companyResults.filter(r => r.verificationStatus === 'verified_official').length, [companyResults]);
+  const probableWebsitesCount = useMemo(() => companyResults.filter(r => r.verificationStatus === 'probable_match').length, [companyResults]);
+  const totalCompanyEmailsCount = useMemo(() => companyResults.reduce((acc, r) => acc + r.discoveredEmails.length, 0), [companyResults]);
+  const uniqueCompanyEmailsCount = useMemo(() => {
+    const set = new Set<string>();
+    companyResults.forEach(r => r.discoveredEmails.forEach(e => { if (e.email) set.add(e.email.toLowerCase().trim()); }));
+    return set.size;
+  }, [companyResults]);
+  const noWebsiteCompaniesCount = useMemo(() => companyResults.filter(r => r.verificationStatus === 'no_website_found').length, [companyResults]);
+
+  // Filtered Company Search Results
+  const filteredCompanyResults = useMemo(() => {
+    let list = companyResults;
+    if (companyFinderStatusFilter === 'verified') {
+      list = list.filter(r => r.verificationStatus === 'verified_official');
+    } else if (companyFinderStatusFilter === 'probable') {
+      list = list.filter(r => r.verificationStatus === 'probable_match');
+    } else if (companyFinderStatusFilter === 'with_emails') {
+      list = list.filter(r => r.discoveredEmails && r.discoveredEmails.length > 0);
+    } else if (companyFinderStatusFilter === 'no_website') {
+      list = list.filter(r => r.verificationStatus === 'no_website_found');
+    }
+
+    if (companySearchTerm.trim()) {
+      const q = companySearchTerm.toLowerCase().trim();
+      list = list.filter(r =>
+        r.companyName.toLowerCase().includes(q) ||
+        (r.productsOrServices && r.productsOrServices.toLowerCase().includes(q)) ||
+        (r.officialWebsite && r.officialWebsite.toLowerCase().includes(q)) ||
+        (r.cleanDomain && r.cleanDomain.toLowerCase().includes(q)) ||
+        r.discoveredEmails.some(e => e.email.toLowerCase().includes(q))
+      );
+    }
+
+    return list;
+  }, [companyResults, companyFinderStatusFilter, companySearchTerm]);
+
+  const companyProgressPercent = companyQueries.length > 0
+    ? Math.min(100, Math.round((companyProgressIndex / companyQueries.length) * 100))
+    : 0;
+
 
   // Keep isPausedRef in sync
   useEffect(() => {
@@ -1115,8 +1456,75 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
         </div>
       </div>
 
-      {/* DASHBOARD METRICS CARDS (Requirement 5) */}
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
+      {/* WORKSPACE MODE SWITCHER */}
+      <div className="flex items-center justify-between p-2 bg-gray-900/90 border border-gray-800 rounded-2xl shadow-xl flex-wrap gap-3">
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setActiveWorkspaceMode('crawler')}
+            className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
+              activeWorkspaceMode === 'crawler'
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/30'
+                : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/60'
+            }`}
+          >
+            <Globe className="w-4 h-4" />
+            <span>Company Website Crawler (Direct Domains)</span>
+            {domainQueue.length > 0 && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] bg-blue-900/80 text-blue-200 border border-blue-400/40 font-mono">
+                {domainQueue.length.toLocaleString()}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveWorkspaceMode('company_finder')}
+            className={`px-4 py-2.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
+              activeWorkspaceMode === 'company_finder'
+                ? 'bg-gradient-to-r from-indigo-600 to-purple-600 text-white shadow-lg shadow-indigo-600/30'
+                : 'text-gray-400 hover:text-gray-200 hover:bg-gray-800/60'
+            }`}
+          >
+            <Search className="w-4 h-4 text-purple-300" />
+            <span>Search Engine Company & Website Finder</span>
+            <span className="px-2 py-0.5 rounded-full text-[10px] bg-purple-500/20 text-purple-300 border border-purple-400/50 font-bold uppercase tracking-wider">
+              Names + Products
+            </span>
+            {companyResults.length > 0 && (
+              <span className="px-2 py-0.5 rounded-full text-[10px] bg-purple-900/80 text-purple-200 border border-purple-400/40 font-mono">
+                {companyResults.length.toLocaleString()}
+              </span>
+            )}
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 text-xs text-gray-400 px-2">
+          {activeWorkspaceMode === 'crawler' ? (
+            <button
+              type="button"
+              onClick={() => setActiveWorkspaceMode('company_finder')}
+              className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1 font-medium underline"
+            >
+              Have company names without websites? Research on Google →
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setActiveWorkspaceMode('crawler')}
+              className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-1 font-medium underline"
+            >
+              Already have websites? Switch to Direct Subpage Crawler →
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* MODE 1: DIRECT DOMAIN WEBSITE CRAWLER */}
+      {activeWorkspaceMode === 'crawler' && (
+        <>
+          {/* DASHBOARD METRICS CARDS (Requirement 5) */}
+          <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
         {/* Metric 1: Total Domains */}
         <div className="bg-gray-800/60 backdrop-blur-sm border border-gray-700/70 rounded-xl p-4 shadow-lg flex flex-col justify-between">
           <span className="text-[11px] font-medium text-gray-400 uppercase tracking-wider">Domains Uploaded</span>
@@ -2329,8 +2737,715 @@ export const CompanyEmailDiscovery: React.FC<CompanyEmailDiscoveryProps> = ({
           )}
         </div>
       )}
+      </>
+      )}
 
-      {/* CRAWL SETTINGS MODAL (Requirement 9) */}
+      {/* MODE 2: SEARCH ENGINE COMPANY & WEBSITE FINDER */}
+      {activeWorkspaceMode === 'company_finder' && (
+        <div className="space-y-6">
+          {/* COMPANY FINDER DASHBOARD METRICS */}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+            {/* Metric 1: Total Companies */}
+            <div className="bg-gray-800/60 backdrop-blur-sm border border-gray-700/70 rounded-xl p-4 shadow-lg flex flex-col justify-between">
+              <span className="text-[11px] font-medium text-gray-400 uppercase tracking-wider flex items-center gap-1.5">
+                <Briefcase className="w-3.5 h-3.5 text-indigo-400" />
+                Companies
+              </span>
+              <div className="text-2xl font-bold text-white mt-1">
+                {totalCompaniesCount.toLocaleString()}
+              </div>
+              <span className="text-[10px] text-gray-400 mt-1">
+                {companyQueries.length > 0 ? `${companyQueries.length} loaded in queue` : 'Enter names or upload file'}
+              </span>
+            </div>
+
+            {/* Metric 2: Verified Official Websites */}
+            <div className="bg-gray-800/60 backdrop-blur-sm border border-emerald-900/40 rounded-xl p-4 shadow-lg flex flex-col justify-between">
+              <span className="text-[11px] font-medium text-emerald-400 uppercase tracking-wider flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Verified Websites
+              </span>
+              <div className="text-2xl font-bold text-emerald-300 mt-1">
+                {verifiedWebsitesCount.toLocaleString()}
+              </div>
+              <span className="text-[10px] text-emerald-400/80 mt-1">
+                {companyResults.length ? `${Math.round((verifiedWebsitesCount / companyResults.length) * 100)}% high confidence (≥70%)` : 'Strict accuracy filter'}
+              </span>
+            </div>
+
+            {/* Metric 3: Probable Matches */}
+            <div className="bg-gray-800/60 backdrop-blur-sm border border-amber-900/40 rounded-xl p-4 shadow-lg flex flex-col justify-between">
+              <span className="text-[11px] font-medium text-amber-400 uppercase tracking-wider flex items-center gap-1.5">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                Probable Matches
+              </span>
+              <div className="text-2xl font-bold text-amber-300 mt-1">
+                {probableWebsitesCount.toLocaleString()}
+              </div>
+              <span className="text-[10px] text-amber-400/80 mt-1">
+                40% - 69% confidence score
+              </span>
+            </div>
+
+            {/* Metric 4: Discovered Corporate Emails */}
+            <div className="bg-gray-800/60 backdrop-blur-sm border border-blue-900/40 rounded-xl p-4 shadow-lg flex flex-col justify-between">
+              <span className="text-[11px] font-medium text-blue-400 uppercase tracking-wider flex items-center gap-1.5">
+                <Mail className="w-3.5 h-3.5" />
+                Corporate Emails
+              </span>
+              <div className="text-2xl font-bold text-blue-300 mt-1">
+                {totalCompanyEmailsCount.toLocaleString()}
+              </div>
+              <span className="text-[10px] text-blue-300/80 mt-1 font-mono">
+                {uniqueCompanyEmailsCount.toLocaleString()} unique addresses
+              </span>
+            </div>
+
+            {/* Metric 5: No Website Found */}
+            <div className="bg-gray-800/60 backdrop-blur-sm border border-red-900/40 rounded-xl p-4 shadow-lg flex flex-col justify-between">
+              <span className="text-[11px] font-medium text-red-400 uppercase tracking-wider flex items-center gap-1.5">
+                <XCircle className="w-3.5 h-3.5" />
+                No Website Found
+              </span>
+              <div className="text-2xl font-bold text-red-300 mt-1">
+                {noWebsiteCompaniesCount.toLocaleString()}
+              </div>
+              <span className="text-[10px] text-red-400/80 mt-1">
+                Directories bypassed / no site
+              </span>
+            </div>
+          </div>
+
+          {/* INPUT ZONE & SEARCH ENGINE CONTROL DECK */}
+          <div className="bg-gray-800/40 backdrop-blur-md border border-gray-700/80 rounded-2xl p-6 shadow-xl">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              {/* LEFT: Company Names & Products Text Area */}
+              <div className="lg:col-span-8 space-y-3">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <label className="text-sm font-semibold text-white flex items-center gap-2">
+                    <Search className="w-4 h-4 text-purple-400" />
+                    Company Names & Optional Products/Services
+                    {companyQueries.length > 0 && (
+                      <span className="text-xs font-normal text-purple-300 bg-purple-950/70 border border-purple-700/50 px-2 py-0.5 rounded-full font-mono">
+                        {companyQueries.length.toLocaleString()} companies parsed
+                      </span>
+                    )}
+                  </label>
+
+                  {/* Actions & File Upload */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <input
+                      ref={companyFileInputRef}
+                      type="file"
+                      accept=".txt,.csv,.xlsx,.xls"
+                      onChange={handleCompanyFileUpload}
+                      className="hidden"
+                    />
+
+                    <button
+                      type="button"
+                      onClick={() => companyFileInputRef.current?.click()}
+                      disabled={isSearchingCompanies}
+                      className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600/30 hover:bg-indigo-600/40 text-indigo-200 border border-indigo-500/40 flex items-center gap-1.5 transition-all shadow-sm"
+                      title="Upload Excel (XLSX, XLS), CSV, or TXT file with company names and products"
+                    >
+                      <Upload className="w-3.5 h-3.5 text-indigo-300" />
+                      Upload File (.xlsx, .csv, .txt)
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const sampleText = [
+                          'Siemens - Industrial Automation & Drives - Germany',
+                          'Bosch - Automotive Parts & Mobility - Germany',
+                          'Pfizer - Bio-Pharmaceuticals & Vaccines - USA',
+                          'Novartis - Healthcare & Oncology - Switzerland',
+                          'Maersk - Container Logistics & Shipping - Denmark',
+                          'ABB - Robotics & Electrification - Switzerland',
+                          'Schneider Electric - Energy Management & Automation - France',
+                          'Caterpillar - Heavy Construction Machinery - USA'
+                        ].join('\n');
+                        setCompanyInputText(sampleText);
+                        const parsed = parseCompanyNamesFromText(sampleText);
+                        setCompanyQueries(parsed.queries);
+                        showToast(`✓ Loaded ${parsed.queries.length} sample companies with products!`);
+                      }}
+                      disabled={isSearchingCompanies}
+                      className="px-2.5 py-1.5 text-xs font-medium rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 flex items-center gap-1 transition-all"
+                      title="Load sample global enterprise list with products and locations"
+                    >
+                      <Sparkles className="w-3 h-3 text-purple-400" />
+                      Sample
+                    </button>
+
+                    {companyInputText && (
+                      <button
+                        type="button"
+                        onClick={handleClearCompanySearch}
+                        disabled={isSearchingCompanies}
+                        className="px-2 py-1.5 text-xs text-gray-400 hover:text-red-400 transition-colors"
+                        title="Clear input and results"
+                      >
+                        Clear
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Auto Column Mapping Banner */}
+                {companyDetectedColumns && companyDetectedColumns.length > 0 && (
+                  <div className="flex items-center gap-2 p-2 rounded-lg bg-indigo-950/60 border border-indigo-600/40 text-[11px] text-indigo-300">
+                    <CheckCheck className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                    <span>
+                      Smart Column Mapping Active: <strong>{companyDetectedColumns.join(' • ')}</strong>
+                    </span>
+                  </div>
+                )}
+
+                <div className="relative">
+                  <textarea
+                    value={companyInputText}
+                    onChange={handleCompanyTextChange}
+                    placeholder={`Enter company names to research on Google & search engines:\n\nAcme Corporation\nSiemens - Industrial Automation - Germany\nNovartis - Pharmaceuticals\nGeneral Electric - Aviation & Power\nMaersk - Container Shipping\n\nSupports 1 company per line, or CSV/TSV table with 'Company Name', 'Product/Service', and 'Country' columns.`}
+                    rows={8}
+                    className="w-full bg-gray-900/90 border border-gray-700 rounded-xl p-3 text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500/50 font-mono resize-y"
+                    disabled={isSearchingCompanies}
+                  />
+                  <div className="text-[10px] text-gray-500 mt-1 flex justify-between">
+                    <span>Format: Plain company names, CSV columns, or 'Company - Product - Country'</span>
+                    <span>{companyQueries.length.toLocaleString()} companies ready</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* RIGHT: Search Engine Control Deck */}
+              <div className="lg:col-span-4 flex flex-col justify-between space-y-4 bg-gray-900/60 border border-gray-800 rounded-xl p-5">
+                <div>
+                  <h3 className="text-sm font-bold text-white flex items-center justify-between">
+                    <span>Search Engine Research</span>
+                    <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono border ${
+                      isSearchingCompanies
+                        ? isCompanySearchPaused
+                          ? 'bg-amber-950 text-amber-300 border-amber-600'
+                          : 'bg-purple-950 text-purple-300 border-purple-500 animate-pulse'
+                        : 'bg-gray-800 text-gray-400 border-gray-700'
+                    }`}>
+                      {isSearchingCompanies ? (isCompanySearchPaused ? 'Paused' : 'Searching Engines') : 'Standby'}
+                    </span>
+                  </h3>
+
+                  <div className="mt-3 space-y-2.5 text-xs text-gray-300">
+                    {/* Concurrency Selector */}
+                    <div className="py-1 border-b border-gray-800 flex items-center justify-between">
+                      <span className="text-gray-400">Parallel Workers:</span>
+                      <select
+                        value={companyConcurrency}
+                        onChange={e => setCompanyConcurrency(Math.min(4, Math.max(1, parseInt(e.target.value) || 2)))}
+                        disabled={isSearchingCompanies}
+                        className="bg-gray-800 border border-gray-700 rounded px-2 py-0.5 text-xs text-purple-300 font-semibold"
+                      >
+                        <option value={1}>1 Worker (Polite)</option>
+                        <option value={2}>2 Workers (Optimal)</option>
+                        <option value={3}>3 Workers (Fast)</option>
+                        <option value={4}>4 Workers (Max)</option>
+                      </select>
+                    </div>
+
+                    {/* Email Discovery Checkbox */}
+                    <div className="py-1 border-b border-gray-800">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={companyDiscoverEmails}
+                          onChange={e => setCompanyDiscoverEmails(e.target.checked)}
+                          disabled={isSearchingCompanies}
+                          className="w-3.5 h-3.5 accent-purple-500 rounded cursor-pointer"
+                        />
+                        <span className="text-xs text-gray-200 font-medium">Discover Corporate Emails</span>
+                      </label>
+                      <p className="text-[10px] text-gray-400 pl-5.5 mt-0.5">
+                        Crawls verified official website & Google search index for clean corporate emails (sales@, info@, export@).
+                      </p>
+                    </div>
+
+                    {/* Strict Directory Filter Note */}
+                    <div className="py-1 text-[11px] text-emerald-400/90 flex items-start gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 shrink-0 mt-0.5 text-emerald-400" />
+                      <span>
+                        Strict Anti-Directory Filtering active: automatically bypasses Wikipedia, Yelp, LinkedIn, YellowPages, Facebook & catalog scrapers.
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Control Action Buttons */}
+                <div className="space-y-2 pt-2">
+                  {!isSearchingCompanies ? (
+                    <button
+                      type="button"
+                      onClick={handleStartCompanySearch}
+                      disabled={companyQueries.length === 0}
+                      className="w-full py-3 px-4 rounded-xl font-bold text-sm bg-gradient-to-r from-purple-600 via-indigo-600 to-blue-600 hover:from-purple-500 hover:to-blue-500 text-white shadow-lg shadow-purple-600/30 border border-purple-400/40 disabled:opacity-50 flex items-center justify-center gap-2 transition-all cursor-pointer"
+                    >
+                      <Search className="w-4 h-4" />
+                      Find Websites on Google ({companyQueries.length.toLocaleString()})
+                    </button>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={handleToggleCompanyPause}
+                        className={`py-2.5 px-3 rounded-xl font-bold text-xs border flex items-center justify-center gap-1.5 transition-all ${
+                          isCompanySearchPaused
+                            ? 'bg-amber-600 hover:bg-amber-500 text-white border-amber-400/40 shadow-lg shadow-amber-600/30'
+                            : 'bg-gray-800 hover:bg-gray-700 text-amber-300 border-gray-600'
+                        }`}
+                      >
+                        {isCompanySearchPaused ? <Play className="w-3.5 h-3.5 fill-current" /> : <Pause className="w-3.5 h-3.5 fill-current" />}
+                        {isCompanySearchPaused ? 'Resume' : 'Pause'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleStopCompanySearch}
+                        className="py-2.5 px-3 rounded-xl font-bold text-xs bg-red-600/30 hover:bg-red-600/50 text-red-200 border border-red-500/50 flex items-center justify-center gap-1.5 transition-all"
+                      >
+                        <Square className="w-3.5 h-3.5 fill-current" />
+                        Stop
+                      </button>
+                    </div>
+                  )}
+
+                  {companyResults.length > 0 && !isSearchingCompanies && (
+                    <button
+                      type="button"
+                      onClick={handleTransferVerifiedWebsitesToCrawler}
+                      disabled={verifiedWebsitesCount + probableWebsitesCount === 0}
+                      className="w-full py-2 px-3 rounded-xl font-semibold text-xs bg-gradient-to-r from-blue-700 to-teal-700 hover:from-blue-600 hover:to-teal-600 text-white border border-teal-400/40 flex items-center justify-center gap-2 shadow-sm transition-all"
+                    >
+                      <ArrowRight className="w-3.5 h-3.5" />
+                      Transfer {verifiedWebsitesCount + probableWebsitesCount} Verified Websites to Deep Crawler
+                    </button>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            {/* LIVE SEARCH ENGINE PROGRESS BAR & WORKERS */}
+            {isSearchingCompanies && (
+              <div className="mt-4 pt-4 border-t border-gray-700/80 space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                    <span className="w-2 h-2 rounded-full bg-purple-400 animate-ping" />
+                    Searching Google & Multi-Engine:
+                  </span>
+                  <span className="font-mono text-gray-300">
+                    {companyProgressIndex} / {companyQueries.length} companies ({companyProgressPercent}%)
+                  </span>
+                </div>
+
+                <div className="w-full h-2.5 bg-gray-900 rounded-full overflow-hidden border border-gray-700">
+                  <div
+                    className="h-full bg-gradient-to-r from-purple-500 via-indigo-500 to-blue-400 transition-all duration-300"
+                    style={{ width: `${companyProgressPercent}%` }}
+                  />
+                </div>
+
+                {companyActiveWorkers.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap pt-1">
+                    <span className="text-[11px] text-gray-400 font-medium">Active Workers:</span>
+                    {companyActiveWorkers.map((wName, i) => (
+                      <span
+                        key={i}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md text-[11px] font-mono bg-purple-950/80 border border-purple-700/60 text-purple-300 shadow-sm"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                        {wName}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ACTION & EXPORT BAR FOR COMPANY FINDER */}
+          <div className="bg-gray-800/60 backdrop-blur-md border border-gray-700/80 rounded-2xl p-4 shadow-xl space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+              {/* Filter Pills */}
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => setCompanyFinderStatusFilter('all')}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all ${
+                    companyFinderStatusFilter === 'all'
+                      ? 'bg-purple-600 text-white shadow-md shadow-purple-600/30'
+                      : 'bg-gray-900 text-gray-400 hover:text-white border border-gray-800'
+                  }`}
+                >
+                  All Researched ({companyResults.length})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompanyFinderStatusFilter('verified')}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+                    companyFinderStatusFilter === 'verified'
+                      ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30'
+                      : 'bg-gray-900 text-emerald-400 hover:text-white border border-gray-800'
+                  }`}
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  Verified Official ({verifiedWebsitesCount})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompanyFinderStatusFilter('probable')}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+                    companyFinderStatusFilter === 'probable'
+                      ? 'bg-amber-600 text-white shadow-md shadow-amber-600/30'
+                      : 'bg-gray-900 text-amber-400 hover:text-white border border-gray-800'
+                  }`}
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  Probable ({probableWebsitesCount})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompanyFinderStatusFilter('with_emails')}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+                    companyFinderStatusFilter === 'with_emails'
+                      ? 'bg-blue-600 text-white shadow-md shadow-blue-600/30'
+                      : 'bg-gray-900 text-blue-400 hover:text-white border border-gray-800'
+                  }`}
+                >
+                  <Mail className="w-3.5 h-3.5" />
+                  Has Emails ({companyResults.filter(r => r.discoveredEmails.length > 0).length})
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setCompanyFinderStatusFilter('no_website')}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 ${
+                    companyFinderStatusFilter === 'no_website'
+                      ? 'bg-red-700 text-white shadow-md shadow-red-700/30'
+                      : 'bg-gray-900 text-red-400 hover:text-white border border-gray-800'
+                  }`}
+                >
+                  <XCircle className="w-3.5 h-3.5" />
+                  No Website ({noWebsiteCompaniesCount})
+                </button>
+              </div>
+
+              {/* Action Buttons: 1-Click Pipeline Transfer & Exports */}
+              <div className="flex items-center gap-2 flex-wrap">
+                {/* Primary: Transfer to Crawler */}
+                <button
+                  type="button"
+                  onClick={handleTransferVerifiedWebsitesToCrawler}
+                  disabled={verifiedWebsitesCount + probableWebsitesCount === 0}
+                  className="px-3.5 py-2 text-xs font-bold rounded-xl bg-gradient-to-r from-blue-600 to-teal-600 hover:from-blue-500 hover:to-teal-500 disabled:opacity-40 text-white border border-teal-400/50 flex items-center gap-1.5 shadow-md shadow-teal-700/30 transition-all cursor-pointer"
+                  title="Send all verified official websites into the Deep Subpage Crawler queue"
+                >
+                  <Globe className="w-3.5 h-3.5 text-teal-200" />
+                  <span>Send to Domain Crawler</span>
+                  {verifiedWebsitesCount + probableWebsitesCount > 0 && (
+                    <span className="bg-teal-950 px-1.5 py-0.5 rounded-full text-[10px] font-mono border border-teal-400/50">
+                      {verifiedWebsitesCount + probableWebsitesCount}
+                    </span>
+                  )}
+                </button>
+
+                {/* Clean Emails Exports */}
+                <button
+                  type="button"
+                  onClick={handleExportCompanyEmailsTxt}
+                  disabled={totalCompanyEmailsCount === 0}
+                  className="px-3 py-2 text-xs font-semibold rounded-xl bg-emerald-700/80 hover:bg-emerald-600 text-white border border-emerald-500/50 flex items-center gap-1.5 disabled:opacity-40 transition-all shadow-sm"
+                  title="Export discovered corporate emails as clean 1-per-line TXT"
+                >
+                  <Mail className="w-3.5 h-3.5 text-emerald-200" />
+                  Save Emails (TXT)
+                </button>
+
+                {/* Clean Websites Exports */}
+                <button
+                  type="button"
+                  onClick={() => handleExportCompanyWebsitesTxt(true)}
+                  disabled={verifiedWebsitesCount + probableWebsitesCount === 0}
+                  className="px-3 py-2 text-xs font-semibold rounded-xl bg-gray-800 hover:bg-gray-750 text-gray-200 border border-gray-700 flex items-center gap-1.5 disabled:opacity-40 transition-all"
+                  title="Save clean verified company websites/domains as TXT"
+                >
+                  <Download className="w-3.5 h-3.5 text-blue-400" />
+                  Save Websites (TXT)
+                </button>
+
+                {/* Full Excel Export */}
+                <button
+                  type="button"
+                  onClick={handleExportCompanyExcel}
+                  disabled={companyResults.length === 0}
+                  className="px-3 py-2 text-xs font-bold rounded-xl bg-gradient-to-r from-emerald-600 to-green-700 hover:from-emerald-500 hover:to-green-600 text-white border border-emerald-400/40 flex items-center gap-1.5 disabled:opacity-40 transition-all shadow-sm"
+                  title="Download complete research report with Companies, Verified Websites, and Discovered Emails sheets"
+                >
+                  <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-100" />
+                  Excel Report (.xlsx)
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleExportCompanyCsv}
+                  disabled={companyResults.length === 0}
+                  className="px-2.5 py-2 text-xs font-semibold rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 flex items-center gap-1 disabled:opacity-40 transition-all"
+                  title="Download company research results as CSV"
+                >
+                  CSV
+                </button>
+              </div>
+            </div>
+
+            {/* Search Filter input */}
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+              <input
+                type="text"
+                value={companySearchTerm}
+                onChange={e => setCompanySearchTerm(e.target.value)}
+                placeholder="Search researched companies by name, products, website domain, or email..."
+                className="w-full pl-9 pr-4 py-2 bg-gray-900 border border-gray-700 rounded-xl text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+              />
+            </div>
+          </div>
+
+          {/* RESEARCHED COMPANIES RESULTS TABLE */}
+          <div className="bg-gray-800/40 backdrop-blur-md border border-gray-700/80 rounded-2xl shadow-xl overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-gray-900/90 text-gray-400 font-semibold uppercase tracking-wider border-b border-gray-700/80">
+                    <th className="py-3 px-4 w-12 text-center">#</th>
+                    <th className="py-3 px-4 min-w-[200px]">Company Name & Products</th>
+                    <th className="py-3 px-4 min-w-[220px]">Official Website (Verified)</th>
+                    <th className="py-3 px-4 min-w-[130px]">Accuracy Score</th>
+                    <th className="py-3 px-4 min-w-[240px]">Discovered Corporate Emails</th>
+                    <th className="py-3 px-4 min-w-[150px]">Verification Reason</th>
+                    <th className="py-3 px-3 text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-800 text-gray-200">
+                  {filteredCompanyResults.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-12 text-center text-gray-500">
+                        <div className="max-w-md mx-auto space-y-3">
+                          <div className="w-12 h-12 rounded-2xl bg-purple-950/60 border border-purple-800/50 text-purple-400 flex items-center justify-center mx-auto">
+                            <Search className="w-6 h-6" />
+                          </div>
+                          <p className="text-sm font-semibold text-gray-300">
+                            {companyResults.length === 0
+                              ? "No companies researched yet"
+                              : "No companies match the selected filter"}
+                          </p>
+                          <p className="text-xs text-gray-500">
+                            {companyResults.length === 0
+                              ? "Upload or enter company names (with or without products) above and click 'Find Websites on Google' to automatically locate authentic official websites and corporate emails."
+                              : "Try adjusting your search query or switching to 'All Researched'."}
+                          </p>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredCompanyResults.map((result, idx) => {
+                      const isHighConf = result.confidenceScore >= 70;
+                      const isProbable = result.confidenceScore >= 40 && result.confidenceScore < 70;
+                      const isExpanded = expandedCompanyId === result.id;
+
+                      return (
+                        <tr
+                          key={result.id || idx}
+                          className="hover:bg-gray-800/50 transition-colors group"
+                        >
+                          <td className="py-3 px-4 text-center text-gray-500 font-mono text-[11px]">
+                            {idx + 1}
+                          </td>
+
+                          {/* Company Name, Products & Country */}
+                          <td className="py-3 px-4">
+                            <div className="space-y-1">
+                              <span className="font-bold text-white text-sm block">
+                                {result.companyName}
+                              </span>
+
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                {result.productsOrServices && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-purple-950/70 border border-purple-700/50 text-purple-300">
+                                    <Package className="w-2.5 h-2.5" />
+                                    {result.productsOrServices}
+                                  </span>
+                                )}
+                                {result.countryOrLocation && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] bg-blue-950/70 border border-blue-700/50 text-blue-300">
+                                    <MapPin className="w-2.5 h-2.5" />
+                                    {result.countryOrLocation}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </td>
+
+                          {/* Official Website */}
+                          <td className="py-3 px-4">
+                            {result.cleanDomain && result.officialWebsite ? (
+                              <div className="space-y-1">
+                                <a
+                                  href={result.officialWebsite}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="font-mono font-semibold text-blue-400 hover:text-blue-300 hover:underline flex items-center gap-1 text-xs"
+                                >
+                                  <span>{result.cleanDomain}</span>
+                                  <ExternalLink className="w-3 h-3 shrink-0" />
+                                </a>
+                                {result.pageTitle && (
+                                  <span className="text-[11px] text-gray-400 block truncate max-w-xs" title={result.pageTitle}>
+                                    {result.pageTitle}
+                                  </span>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-1 text-gray-500 italic text-xs">
+                                <XCircle className="w-3.5 h-3.5 text-red-400/80" />
+                                <span>No official website found</span>
+                              </div>
+                            )}
+                          </td>
+
+                          {/* Accuracy Score */}
+                          <td className="py-3 px-4">
+                            <div className="space-y-1">
+                              <span
+                                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold font-mono border ${
+                                  isHighConf
+                                    ? 'bg-emerald-950/80 text-emerald-300 border-emerald-600/60 shadow-sm'
+                                    : isProbable
+                                    ? 'bg-amber-950/80 text-amber-300 border-amber-600/60'
+                                    : 'bg-red-950/80 text-red-400 border-red-700/60'
+                                }`}
+                              >
+                                {isHighConf && <CheckCircle2 className="w-3 h-3" />}
+                                {isProbable && <ShieldCheck className="w-3 h-3" />}
+                                {!isHighConf && !isProbable && <XCircle className="w-3 h-3" />}
+                                {result.confidenceScore}% {isHighConf ? 'Authentic' : isProbable ? 'Probable' : 'Unmatched'}
+                              </span>
+                            </div>
+                          </td>
+
+                          {/* Discovered Corporate Emails */}
+                          <td className="py-3 px-4">
+                            {result.discoveredEmails && result.discoveredEmails.length > 0 ? (
+                              <div className="space-y-1.5">
+                                <div className="flex items-center gap-1 flex-wrap">
+                                  {result.discoveredEmails.slice(0, 3).map((e, eIdx) => (
+                                    <button
+                                      key={eIdx}
+                                      type="button"
+                                      onClick={() => {
+                                        navigator.clipboard.writeText(e.email);
+                                        showToast(`✓ Copied ${e.email} to clipboard!`);
+                                      }}
+                                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-950/70 hover:bg-emerald-900 border border-emerald-600/50 text-emerald-200 text-[11px] font-mono transition-colors group/em"
+                                      title={`Category: ${e.category} • Source: ${e.sourcePageUrl} (Click to copy)`}
+                                    >
+                                      <span>{e.email}</span>
+                                      <Copy className="w-2.5 h-2.5 opacity-60 group-hover/em:opacity-100" />
+                                    </button>
+                                  ))}
+                                  {result.discoveredEmails.length > 3 && (
+                                    <span className="text-[10px] text-gray-400 font-mono">
+                                      +{result.discoveredEmails.length - 3} more
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-[10px] text-gray-500 block">
+                                  {result.discoveredEmails.length} public business {result.discoveredEmails.length === 1 ? 'address' : 'addresses'}
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="text-[11px] text-gray-500 italic">
+                                No public emails on scanned pages
+                              </span>
+                            )}
+                          </td>
+
+                          {/* Verification Reason */}
+                          <td className="py-3 px-4">
+                            <span className="text-[11px] text-gray-400 leading-tight block max-w-xs">
+                              {result.verificationReason || 'Search engine match'}
+                            </span>
+                          </td>
+
+                          {/* Actions */}
+                          <td className="py-3 px-3 text-right">
+                            <div className="flex items-center justify-end gap-1.5">
+                              {result.cleanDomain && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    navigator.clipboard.writeText(result.cleanDomain!);
+                                    showToast(`✓ Copied domain ${result.cleanDomain}!`);
+                                  }}
+                                  className="p-1.5 text-gray-400 hover:text-white rounded hover:bg-gray-700 transition-colors"
+                                  title="Copy domain name"
+                                >
+                                  <Copy className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              {result.cleanDomain && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setDomainQueue(prev => Array.from(new Set([...prev, result.cleanDomain!.toLowerCase()])));
+                                    setInputText(prev => prev ? `${prev}\n${result.cleanDomain}` : result.cleanDomain!);
+                                    setActiveWorkspaceMode('crawler');
+                                    showToast(`✓ Added ${result.cleanDomain} to Crawler queue!`);
+                                  }}
+                                  className="p-1.5 text-blue-400 hover:text-blue-300 rounded hover:bg-blue-950 transition-colors"
+                                  title="Send this website to Direct Domain Crawler"
+                                >
+                                  <Globe className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              {result.discoveredEmails.length > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const ems = result.discoveredEmails.map(e => e.email).join('\n');
+                                    navigator.clipboard.writeText(ems);
+                                    showToast(`✓ Copied ${result.discoveredEmails.length} emails for ${result.companyName}!`);
+                                  }}
+                                  className="p-1.5 text-emerald-400 hover:text-emerald-300 rounded hover:bg-emerald-950 transition-colors"
+                                  title="Copy all corporate emails for this company"
+                                >
+                                  <Mail className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
       {showConfigModal && (
         <div className="fixed inset-0 z-[120] bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-gray-900 border border-gray-700 rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-5">
