@@ -26,6 +26,7 @@ import type { UserProfile } from '../services/serverApiClient';
 
 export type TabKey =
   | 'extractor'
+  | 'company-discovery'
   | 'server-jobs'
   | 'file-text-extractor'
   | 'bulk-extractor'
@@ -85,6 +86,17 @@ export const NAV_SECTIONS: NavSection[] = [
         icon: Search,
         activeColor: 'bg-blue-600 text-white shadow-blue-500/20 shadow-lg border-blue-400/40',
         hoverColor: 'hover:bg-blue-950/40 hover:text-blue-300',
+      },
+      {
+        key: 'company-discovery',
+        label: 'Company Email Finder',
+        shortLabel: 'Company Finder',
+        description: 'Automatic Website & Subpage Discovery',
+        icon: Globe,
+        badge: 'Web Spider',
+        badgeStyle: 'bg-indigo-950 text-indigo-300 border-indigo-500/40 font-semibold',
+        activeColor: 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white shadow-indigo-500/20 shadow-lg border-indigo-400/40',
+        hoverColor: 'hover:bg-indigo-950/40 hover:text-indigo-300',
       },
       {
         key: 'server-jobs',

@@ -205,6 +205,56 @@ export interface SessionCheckpointRecord {
   updatedAt: string;
 }
 
+export interface DiscoveredEmailRecord {
+  id: string;
+  companyDomain: string;
+  companyWebsite: string;
+  companyName: string;
+  email: string;
+  category: string;
+  sourcePageUrl: string;
+  foundIn: string;
+  discoveredAt: string;
+  discoveryStatus: string; // e.g. 'Publicly Listed'
+  pageTitle?: string;
+  phone?: string;
+}
+
+export interface DomainCrawlStatusRecord {
+  domain: string;
+  website: string;
+  companyName: string;
+  status: 'success' | 'no_emails' | 'unavailable';
+  statusCode?: number;
+  pagesScanned: number;
+  emailsCount: number;
+  error?: string;
+  crawledPages?: Array<{ url: string; title?: string; emailsFound: number }>;
+}
+
+export interface CompanyDiscoverySessionRecord {
+  id: string;
+  title: string;
+  totalDomains: number;
+  websitesAccessed: number;
+  websitesUnavailable: number;
+  totalPagesScanned: number;
+  totalEmailsFound: number;
+  uniqueEmailsFound: number;
+  companiesWithoutEmails: number;
+  domains: DomainCrawlStatusRecord[];
+  records: DiscoveredEmailRecord[];
+  config?: {
+    maxPagesPerDomain?: number;
+    concurrency?: number;
+    delayMs?: number;
+    depth?: number;
+  };
+  userId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // Atomic file store helper
 class JsonTable<T extends { id?: string; key?: string }> {
   private filePath: string;
@@ -292,6 +342,7 @@ const vaultTable = new JsonTable<SecretVaultRecord>('secret_vault.json', 'id');
 const tempFilesTable = new JsonTable<TempFileRecord>('temp_files.json', 'id');
 const cloudFilesTable = new JsonTable<CloudFileRecord>('cloud_files.json', 'id');
 const checkpointsTable = new JsonTable<SessionCheckpointRecord>('checkpoints.json', 'id');
+const companyDiscoveriesTable = new JsonTable<CompanyDiscoverySessionRecord>('company_discoveries.json', 'id');
 
 // Helper for passwords
 export function hashPassword(password: string, salt?: string): { hash: string; salt: string } {
@@ -1384,6 +1435,54 @@ export const dbCheckpoints = {
       return checkpointsTable.delete(byTab.id);
     }
     return false;
+  }
+};
+
+// Persistent Company Email Discovery Projects
+export const dbCompanyDiscoveries = {
+  saveSession(session: Partial<CompanyDiscoverySessionRecord> & { title: string }): CompanyDiscoverySessionRecord {
+    const now = new Date().toISOString();
+    const id = session.id || `cdis_${crypto.randomUUID().slice(0, 12)}`;
+    const existing = companyDiscoveriesTable.get(id);
+
+    const record: CompanyDiscoverySessionRecord = {
+      id,
+      title: session.title,
+      totalDomains: session.totalDomains ?? existing?.totalDomains ?? 0,
+      websitesAccessed: session.websitesAccessed ?? existing?.websitesAccessed ?? 0,
+      websitesUnavailable: session.websitesUnavailable ?? existing?.websitesUnavailable ?? 0,
+      totalPagesScanned: session.totalPagesScanned ?? existing?.totalPagesScanned ?? 0,
+      totalEmailsFound: session.totalEmailsFound ?? existing?.totalEmailsFound ?? 0,
+      uniqueEmailsFound: session.uniqueEmailsFound ?? existing?.uniqueEmailsFound ?? 0,
+      companiesWithoutEmails: session.companiesWithoutEmails ?? existing?.companiesWithoutEmails ?? 0,
+      domains: session.domains || existing?.domains || [],
+      records: session.records || existing?.records || [],
+      config: session.config || existing?.config,
+      userId: session.userId || existing?.userId,
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    };
+
+    companyDiscoveriesTable.set(id, record);
+    return record;
+  },
+
+  getSession(id: string): CompanyDiscoverySessionRecord | undefined {
+    return companyDiscoveriesTable.get(id);
+  },
+
+  listSessions(userId?: string): CompanyDiscoverySessionRecord[] {
+    const all = companyDiscoveriesTable.getAll();
+    if (userId && userId !== 'admin') {
+      return all
+        .filter(s => !s.userId || s.userId === userId || s.userId === 'anonymous')
+        .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    }
+    return all.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  },
+
+  deleteSession(id: string): boolean {
+    return companyDiscoveriesTable.delete(id);
   }
 };
 

@@ -11,6 +11,7 @@ import SettingsModal from './components/SettingsModal';
 import { FolderExtractor } from './components/FolderExtractor';
 import { BulkUrlOpener } from './components/BulkUrlOpener';
 import { FileTextContactExtractor } from './components/FileTextContactExtractor';
+import { CompanyEmailDiscovery } from './components/CompanyEmailDiscovery';
 import { findAndExtractEmails, suggestKeywords, generateDeepSearchPlan, analyzeCompanyFromEmail, setGlobalApiKey } from './services/geminiService';
 import { buildDorkQuery, getCountryCcTLD, getSearchEngineUrl, SEARCH_ENGINES_LIST, EMAIL_PREFIX_OPTIONS, extractEmailsFromText } from './services/dorkHelper';
 import { filterDuplicateCompanies } from './services/duplicateChecker';
@@ -1642,6 +1643,18 @@ const App: React.FC = () => {
                   />
                   {renderExtractorContent()}
                 </div>
+              </div>
+
+              {/* TAB 1B: Company Website Email Discovery System */}
+              <div className={activeTab === 'company-discovery' ? 'block' : 'hidden'}>
+                <CompanyEmailDiscovery
+                  showToast={showToast}
+                  onSendToValidator={(emails) => handleNavigateWithPayload('validator', { emails })}
+                  onSendToEmailSender={handleTransferToEmailSender}
+                  currentUser={currentUser}
+                  onOpenAuth={() => setIsAuthModalOpen(true)}
+                  onNavigateToServerJobs={() => setActiveTab('server-jobs')}
+                />
               </div>
 
               {/* TAB 2: Server Background Jobs & DB Tasks */}

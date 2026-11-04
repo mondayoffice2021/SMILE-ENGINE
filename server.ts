@@ -28,6 +28,7 @@ import { authMiddleware, registerAuthRoutes } from "./server/auth";
 import { registerJobRoutes } from "./server/jobs";
 import { registerAdminRoutes } from "./server/admin";
 import { registerVaultAndTempRoutes } from "./server/vaultAndTempRoutes";
+import { registerCompanyDiscoveryRoutes } from "./server/companyDiscoveryRoutes";
 
 const resolveMx = promisify(dns.resolveMx);
 const resolveTxt = promisify(dns.resolveTxt);
@@ -181,6 +182,7 @@ async function startServer() {
   registerJobRoutes(app);
   registerAdminRoutes(app);
   registerVaultAndTempRoutes(app);
+  registerCompanyDiscoveryRoutes(app);
 
   // API Routes
   app.get("/api/health", (req, res) => {
